@@ -756,13 +756,6 @@ DANGEROUS_PATTERNS = [
     # opaque, so include it in the same alternation.
     (r'\bkill\b.*\$\(\s*(pgrep|pidof)\b', "kill process via pgrep/pidof expansion (self-termination)"),
     (r'\bkill\b.*`\s*(pgrep|pidof)\b', "kill process via backtick pgrep/pidof expansion (self-termination)"),
-    # Self-termination via kill + numeric PID. Name-based patterns and
-    # pgrep-expansion patterns above don't catch `kill 406 231` where the
-    # agent discovered PIDs via `ps` and is targeting them directly.
-    # A plain `kill <pid>` sends SIGTERM (signal 15), which is enough to
-    # terminate the agent's own process. Require approval for any kill
-    # that targets a numeric PID unless it's a signal-list query (-l).
-    (r'\bkill\b(?!\s+-[lL]\b)(?:\s+-\S+(?:\s+\S+)?)?\s+\d+', "kill process(es) by PID"),
     # launchctl-driven gateway stop/restart on macOS. The agent can bypass
     # the `hermes gateway stop|restart` pattern above by driving launchd
     # directly against the service label (commonly `ai.hermes.gateway`).
@@ -1174,7 +1167,7 @@ _READ_TOOL_SHORT_OPTIONS_WITH_ARG = {
 }
 _SHELL_PUNCTUATION = {";", "&", "&&", "|", "||", "(", ")", "{", "}"}
 _MAX_DETECTION_COMMAND_CHARS = 128_000
-_MAX_SEPARATOR_FREE_COMMAND_CHARS = 16_384
+_MAX_SEPARATOR_FREE_COMMAND_CHARS = 4_096
 _MAX_DETECTION_SEGMENTS = 25_000
 _PARSER_LIMIT_DESCRIPTION = "command parser limit exceeded"
 _MALFORMED_EXEC_DESCRIPTION = "command parser limit or malformed executable payload"
@@ -1288,14 +1281,7 @@ def _quoted_grep_pattern_spans(command: str) -> tuple[list[tuple[int, int]], boo
                 continue
             tokens = _shell_tokens_with_spans(segment, start)
             if tokens is None:
-                # Tokenizer failed (e.g. unmatched quotes when grep is
-                # inside $() within double-quotes).  Only fail closed
-                # when the fragment appears to carry a -P (PCRE) flag
-                # — without PCRE, quoted grep patterns are harmless
-                # literal strings.
-                if re.search(r'(?:^|\s)-P(?:\s|$)', segment[start:]):
-                    return [], True
-                continue
+                return [], True
             args = tokens[1:]
             pcre = False
             explicit_patterns = False
@@ -1410,17 +1396,10 @@ def _shell_segment_tokens(segment: str, start: int) -> list[str] | None:
 
 
 def _iter_top_level_shell_segments(command: str):
-    """Yield top-level command segments in one left-to-right pass.
-
-    Tracks ``$()`` nesting so that pipe / semicolon characters inside
-    command-substitution subshells are not mistaken for top-level
-    separators (which would split the segment mid-expression and cause
-    the downstream tokenizer to see a malformed fragment).
-    """
+    """Yield top-level command segments in one left-to-right pass."""
     start = 0
     quote: str | None = None
     escaped = False
-    subshell_depth = 0
     index = 0
     while index < len(command):
         char = command[index]
@@ -1428,31 +1407,12 @@ def _iter_top_level_shell_segments(command: str):
             escaped = False
         elif char == "\\" and quote != "'":
             escaped = True
-        # $() command substitution is active inside double-quotes (but not
-        # single-quotes), so detect it regardless of quote state — as long as
-        # we aren't inside a single-quoted string.
-        if char == "$" and index + 1 < len(command) and command[index + 1] == "(" and quote != "'":
-            subshell_depth += 1
-            index += 2
-            continue
-        if subshell_depth > 0 and char == ")" and quote != "'":
-            subshell_depth -= 1
-            index += 1
-            continue
-        if quote:
+        elif quote:
             if char == quote:
                 quote = None
-            index += 1
-            continue
-        if char in {"'", '"'}:
+        elif char in {"'", '"'}:
             quote = char
-            index += 1
-            continue
-        if char in ";&|\n":
-            if subshell_depth > 0:
-                # Inside $(), not a top-level separator
-                index += 1
-                continue
+        elif char in ";&|\n":
             if start < index:
                 yield command[start:index]
             # Consume a doubled && / || separator as one boundary.
@@ -3886,13 +3846,6 @@ _EXEC_CODE_DANGEROUS_CALLS = frozenset({
     ("os", "remove"),
     ("os", "unlink"),
     ("shutil", "rmtree"),
-    # File / directory write (config write bypass, #49578)
-    ("shutil", "copy"),
-    ("shutil", "copy2"),
-    ("shutil", "move"),
-    ("shutil", "copytree"),
-    ("os", "rename"),
-    ("os", "replace"),
     # Arbitrary command execution (bypasses terminal() DANGEROUS_PATTERNS)
     ("os", "system"),
     ("os", "popen"),
@@ -3907,12 +3860,6 @@ _EXEC_CODE_DANGEROUS_CALLS = frozenset({
 # specific functions).  ctypes qualifies — ``ctypes.CDLL(None).unlink(...)``
 # requires no os.remove to bypass every check.
 _EXEC_CODE_SUSPICIOUS_IMPORTS = frozenset({"ctypes"})
-
-# Builtin functions that can write or destroy files without going through
-# imported-module APIs.  ``open(path, "w")`` writes arbitrary local files
-# and its mode argument cannot be statically determined; any call to
-# ``open`` inside execute_code therefore triggers the guard.
-_EXEC_CODE_DANGEROUS_BUILTINS = frozenset({"open"})
 
 
 def _execute_code_has_dangerous_ops(code: str) -> bool:
@@ -3967,10 +3914,6 @@ def _execute_code_has_dangerous_ops(code: str) -> bool:
 
         # Aliased name:  from os import remove  →  remove(x)
         if isinstance(func, ast.Name):
-            # Builtin danger: open() etc. — not an import, statically
-            # undetectable intent (mode arg).  Any call triggers guard.
-            if func.id in _EXEC_CODE_DANGEROUS_BUILTINS:
-                return True
             if func.id in imports:
                 resolved = imports[func.id]
                 if resolved in _EXEC_CODE_DANGEROUS_CALLS:
@@ -4160,7 +4103,7 @@ def check_execute_code_guard(code: str, env_type: str,
             "command": display_command,
             "description": display_description,
             "message": (
-                f"BLOCKED: {display_description}. Asking the user for approval.\n\n"
+                f"⚠️ {display_description}. Asking the user for approval.\n\n"
                 f"**Code:**\n```python\n{display_code}\n```"
             ),
         }
