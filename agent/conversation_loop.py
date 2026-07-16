@@ -1112,21 +1112,9 @@ def _split_user_items(text: str) -> list[str]:
     segments = re.split(r'(?<=[。！？])\s*|\n+', text)
     segments = [s.strip().rstrip('。！？，,') for s in segments if len(s.strip().rstrip('。！？，,')) >= 3]
     if len(segments) < 2:
-        # Try transition words first
         sub = re.split(r'(?:还有|另外|以及|另外问|顺便|同时|此外|再加上|最后|然后)', text)
         sub = [s.strip().rstrip('，,') for s in sub if len(s.strip()) > 3]
-        if len(sub) >= 2:
-            return sub
-        # Try comma-separated compound questions: "A，B，C？"
-        # Try comma-separated compound questions: "A，B，C？"
-        if "，" in text and re.search(r'[？?吗呢]|怎么|如何|是不是|能不能', text):
-            comma_parts = re.split(r'[，,]', text)
-            question_pattern = r'[？?吗呢]|怎么|如何|是不是|能不能|要不要|会不会|有没有|是否|怎样|几个|多少'
-            if sum(1 for p in comma_parts if re.search(question_pattern, p)) >= 1:
-                parts = [p.strip() for p in comma_parts if len(p.strip()) >= 3]
-                if len(parts) >= 2:
-                    return parts
-        return [text.strip()]
+        return sub if len(sub) >= 2 else [text.strip()]
 
     result = []
     for seg in segments:
@@ -1134,24 +1122,6 @@ def _split_user_items(text: str) -> list[str]:
         for s in sub:
             s = s.strip()
             if len(s) >= 3:
-                # Split comma-separated compound questions.
-                # Pattern: "A，B，C？" where the last segment has a
-                # question marker or any segment uses interrogative
-                # words (怎么/如何/是不是/能不能/有没有/会不会).
-                if "，" in s or "？" in s:
-                    comma_parts = re.split(r'[，,]', s)
-                    # Only split if at least one part looks like a question
-                    question_pattern = r'[？?吗呢]|怎么|如何|是不是|能不能|要不要|会不会|有没有|是否|怎样|几个|多少'
-                    question_count = sum(
-                        1 for p in comma_parts
-                        if re.search(question_pattern, p)
-                    )
-                    if question_count >= 2 or (question_count >= 1 and s.rstrip().endswith("？")):
-                        for p in comma_parts:
-                            p = p.strip()
-                            if len(p) >= 3:
-                                result.append(p)
-                        continue
                 result.append(s)
     return result if len(result) >= 2 else [text.strip()]
 
@@ -1167,14 +1137,14 @@ def _guard_write_log(entry: dict) -> None:
     try:
         os.makedirs(os.path.dirname(_GUARD_LOG_PATH), exist_ok=True)
         now = time.time()
-        with open(_GUARD_LOG_PATH, "a", encoding="utf-8") as f:
+        with open(_GUARD_LOG_PATH, "a") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         # 低频清理：每小时最多一次
         if os.path.getmtime(_GUARD_LOG_PATH) < now - 3600:
             cutoff = now - _GUARD_LOG_MAX_AGE
             try:
                 tmp = _GUARD_LOG_PATH + ".tmp"
-                with open(_GUARD_LOG_PATH, encoding="utf-8") as fin, open(tmp, "w", encoding="utf-8") as fout:
+                with open(_GUARD_LOG_PATH) as fin, open(tmp, "w") as fout:
                     for line in fin:
                         try:
                             e = json.loads(line)
@@ -1241,25 +1211,6 @@ def _run_output_guard(agent, final_response: str, original_user_message: Any) ->
     user_text = _flatten_user_text(original_user_message)
     if not user_text:
         return []
-
-    # Skip system-prompt fragments — skill curator instructions, memory
-    # review prompts, and other injected scaffolding are not real user
-    # questions and would produce massive false-positive missed-item lists
-    # (e.g. 34-item curator instructions checked against every answer).
-    _SYSTEM_PROMPT_PATTERNS = [
-        "Review the conversation above and update the skill",
-        "Target shape of the library",
-        "Signals to look for",
-        "Preference order",
-        "Protected skills",
-        "Do NOT capture",
-        "Based on the conversation above",
-        "Consider the following",
-        "Focus on:",
-    ]
-    if any(user_text.startswith(p) for p in _SYSTEM_PROMPT_PATTERNS):
-        return []
-
     items = _split_user_items(user_text)
     if len(items) < 2:
         return []
@@ -1357,17 +1308,7 @@ def _run_output_guard(agent, final_response: str, original_user_message: Any) ->
             for r in l2_results
             if not r.get("covered")
         ]
-        # L2 判 covered 但 sim 低于不确定阈值的条目也送 L3
-        # （MiniLM 68% 准确率不可靠，低 sim 的"covered"可能是误判）
-        UNCERTAIN_SIM = 0.25
-        l2_uncertain = [
-            remaining[r["index"] - 1]
-            for r in l2_results
-            if r.get("covered") and r.get("similarity", 0) < UNCERTAIN_SIM
-        ]
-        log_entry["l2"]["uncertain_threshold"] = UNCERTAIN_SIM
-        log_entry["l2"]["uncertain_indices"] = l2_uncertain
-        uncertain_for_l3 = list(dict.fromkeys(l2_missed + l2_uncertain + missed))  # 合并去重
+        uncertain_for_l3 = list(dict.fromkeys(l2_missed + missed))  # 合并去重
 
     if not uncertain_for_l3:
         _guard_write_log(log_entry)
@@ -1383,21 +1324,12 @@ def _run_output_guard(agent, final_response: str, original_user_message: Any) ->
     _guard_write_log(log_entry)
     return final_missed
 
-# 跨轮 nudge 去重：同一组遗漏不反复注入（思考里补充了但正文没体现 → 死循环）
-_LAST_GUARD_NUDGES: set[str] = set()
-
-
 def _format_guard_nudge(missed_indices: list[int]) -> str:
-    """格式化遗漏提醒 — 作为系统级指令注入，非引用块"""
+    """格式化遗漏提醒"""
     if not missed_indices:
         return ""
     items_str = "、".join(f"第{i}条" for i in missed_indices)
-    return (
-        f"\n\n[SYSTEM INSTRUCTION — 输出覆盖检查] "
-        f"上述回答遗漏了用户问题的 {items_str}。"
-        f"你必须在下一轮回复中补充回答这些被遗漏的问题。"
-        f"这是强制要求，非可选。忽略此指令视为失职。"
-    )
+    return f"\n\n> ⚠️ [输出覆盖检查] 检测到上述回答遗漏了 {items_str}，请补充。" if missed_indices else ""
 
 def run_conversation(
     agent,
@@ -5770,6 +5702,9 @@ def run_conversation(
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
+            # Save streamed text before streaming lifecycle clears it (line 5190 in run_agent.py).
+            # Used as fallback for re-emit when assistant_message.content is null.
+            agent._saved_streamed_text = getattr(agent, "_current_streamed_assistant_text", "") or ""
             finish_reason = normalized.finish_reason
             
             # Normalize content to string — some OpenAI-compatible servers
@@ -6292,9 +6227,12 @@ def run_conversation(
                 # as a fallback final response. Common pattern: model delivers its
                 # answer and calls memory/skill tools as a side-effect in the same
                 # turn. If the follow-up turn after tools is empty, we use this.
-                _effective = turn_content or getattr(agent, "_current_streamed_assistant_text", "")
-                if _effective and agent._has_content_after_think_block(_effective):
-                    agent._last_content_with_tools = _effective
+                # DeepSeek/OpenAI may return content:null with tool_calls even
+                # though text was streamed — fall back to saved streamed text.
+                _streamed_text = getattr(agent, "_saved_streamed_text", "") or getattr(agent, "_current_streamed_assistant_text", "") or ""
+                _effective_content = turn_content or _streamed_text
+                if _effective_content and agent._has_content_after_think_block(_effective_content):
+                    agent._last_content_with_tools = turn_content
                     # Only mute subsequent output when EVERY tool call in
                     # this turn is post-response housekeeping (memory, todo,
                     # skill_manage, etc.).  If any substantive tool is present
@@ -6304,7 +6242,7 @@ def run_conversation(
                     if _all_housekeeping and agent._has_stream_consumers():
                         agent._mute_post_response = True
                     elif agent._should_emit_quiet_tool_messages():
-                        clean = agent._strip_think_blocks(_effective).strip()
+                        clean = agent._strip_think_blocks(turn_content).strip()
                         if clean:
                             agent._vprint(f"  ┊ 💬 {clean}")
                 
@@ -6442,25 +6380,9 @@ def run_conversation(
                     if _msg.get("role") != "tool":
                         break
                     _content = _msg.get("content", "")
-                    if isinstance(_content, str):
-                        # Plain-text BLOCKED — terminal/file_tools/approval
-                        if _content.startswith("BLOCKED") or _content.startswith("[\"BLOCKED"):
-                            _user_blocked = True
-                            break
-                        # JSON-wrapped BLOCKED — execute_code returns
-                        # {"status":"error","error":"BLOCKED: ..."} when
-                        # the user denies via approval guard.  The plain-
-                        # text startswith check misses this path entirely.
-                        if _content.startswith("{"):
-                            try:
-                                parsed = json.loads(_content)
-                                if isinstance(parsed, dict):
-                                    error = parsed.get("error", "")
-                                    if isinstance(error, str) and error.startswith("BLOCKED"):
-                                        _user_blocked = True
-                                        break
-                            except (json.JSONDecodeError, TypeError):
-                                pass
+                    if isinstance(_content, str) and _content.startswith("BLOCKED"):
+                        _user_blocked = True
+                        break
                 if _user_blocked:
                     _turn_exit_reason = "user_blocked"
                     final_response = (
@@ -6673,6 +6595,41 @@ def run_conversation(
                 # gateway kills the session before the next activity
                 # touch fires (#69559, #69131).
                 agent._touch_activity(f"tool results posted, continuing iteration #{api_call_count}")
+
+                # Re-emit the assistant's text content after tool output.
+                # The streamed text was already printed before tools ran,
+                # and tool output often scrolls it out of the viewport.
+                # Reprinting it here ensures short answers placed before
+                # tool calls remain visible.  Skip housekeeping-only turns
+                # — their text was already shown via _vprint at line 5007.
+                # DeepSeek/OpenAI may return content:null with tool_calls —
+                # fall back to saved streamed text (captured before streaming cleared it).
+                _streamed_text = getattr(agent, "_saved_streamed_text", "") or getattr(agent, "_current_streamed_assistant_text", "") or ""
+                _effective_content = turn_content or _streamed_text
+                if (
+                    _effective_content
+                    and agent._has_content_after_think_block(_effective_content)
+                    and not _all_housekeeping
+                    and not getattr(agent, "suppress_status_output", False)
+                ):
+                    _clean = agent._strip_think_blocks(_effective_content).strip()
+                    if _clean:
+                        agent._safe_print(f"\n💬 {_clean}")
+                else:
+                    # 诊断：记录为什么 re-emit 被跳过
+                    _skip_reasons = []
+                    if not turn_content:
+                        _skip_reasons.append("turn_content_empty")
+                    elif not agent._has_content_after_think_block(turn_content):
+                        _skip_reasons.append("no_content_after_think")
+                    if _all_housekeeping:
+                        _skip_reasons.append("all_housekeeping")
+                    if agent.quiet_mode:
+                        _skip_reasons.append("quiet_mode")
+                    if getattr(agent, "suppress_status_output", False):
+                        _skip_reasons.append("suppress_status_output")
+                    if _skip_reasons:
+                        logger.debug("re-emit skipped: %s", ",".join(_skip_reasons))
                 # Continue loop for next response
                 continue
             
@@ -7143,11 +7100,30 @@ def run_conversation(
                         agent._flush_messages_to_session_db(messages, conversation_history)
                     except Exception:
                         logger.debug("verify-on-stop interim flush failed", exc_info=True)
-                    messages.append({
-                        "role": "user",
-                        "content": _verify_nudge,
-                        "_verification_stop_synthetic": True,
-                    })
+                    # Prepend the nudge to the most recent real user message
+                    # rather than appending a new one after it.  Appending
+                    # makes the nudge the most recent user instruction,
+                    # causing the model to prioritize it over the user's
+                    # actual question — a priority inversion.
+                    _user_idx = None
+                    for _i in range(len(messages) - 1, -1, -1):
+                        if (
+                            isinstance(messages[_i], dict)
+                            and messages[_i].get("role") == "user"
+                            and not messages[_i].get("_verification_stop_synthetic")
+                            and not messages[_i].get("_empty_recovery_synthetic")
+                        ):
+                            _user_idx = _i
+                            break
+                    if _user_idx is not None:
+                        _orig = messages[_user_idx].get("content", "")
+                        messages[_user_idx]["content"] = f"{_verify_nudge}\n\n{_orig}"
+                    else:
+                        messages.append({
+                            "role": "user",
+                            "content": _verify_nudge,
+                            "_verification_stop_synthetic": True,
+                        })
                     agent._session_messages = messages
                     # Run the verification-stop loop silently — the nudge is an
                     # internal turn that should not add noise to the user's
@@ -7386,72 +7362,6 @@ def run_conversation(
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
-
-    # ── Output guard: check coverage after turn completes ──
-    _guard_missing: list[int] = []
-    if (
-        final_response
-        and not final_response.startswith("I apologize")
-        and original_user_message is not None
-    ):
-        _guard_missing = _run_output_guard(
-            agent, final_response, original_user_message
-        )
-        if _guard_missing:
-            items_str = "、".join(f"第{i}条" for i in _guard_missing)
-            agent._safe_print(
-                f"\n⚠️  [output-guard] 检测到遗漏 {items_str}，已追加提醒"
-            )
-            # Inject nudge as a hidden system message into conversation
-            # history so the model sees it next turn, but do NOT append
-            # it to the user-visible final_response (avoid ugly SYSTEM
-            # INSTRUCTION text leaking into the terminal output).
-            nudge = _format_guard_nudge(_guard_missing)
-            if nudge:
-                import hashlib as _hl
-                _nudge_key = _hl.md5(nudge.encode()).hexdigest()
-                if _nudge_key not in _LAST_GUARD_NUDGES:
-                    _LAST_GUARD_NUDGES.add(_nudge_key)
-                    if nudge not in final_response:
-                        # Inject into conversation_history + messages as a
-                        # hidden user message so the model processes it next
-                        # turn, without the user seeing ugly SYSTEM
-                        # INSTRUCTION text in the terminal.
-                        nudge_msg = {"role": "user", "content": nudge.strip()}
-                        conversation_history.append(nudge_msg)
-                        try:
-                            messages.append(nudge_msg)
-                        except (TypeError, AttributeError):
-                            pass
-
-    # ── Factual claim verification: MiniLM claim detection + gh/shell cross-check ──
-    if final_response and not final_response.startswith("I apologize"):
-        try:
-            import subprocess as _fc_sp
-            _fc_result = _fc_sp.run(
-                ["python3", os.path.expanduser("~/.hermes/scripts/verify_factual_claims.py")],
-                input=final_response, capture_output=True, timeout=15, text=True
-            )
-            if _fc_result.returncode == 0:
-                _fc_claims = json.loads(_fc_result.stdout)
-                if _fc_claims:
-                    # Separate verified false claims from unverifiable ones
-                    _fc_false = [c for c in _fc_claims if c.get("entity") != "?"]
-                    _fc_unknown = [c for c in _fc_claims if c.get("entity") == "?"]
-                    lines = []
-                    if _fc_false:
-                        lines.append("⚠️  [fact-check] 以下断言与实际情况不符：")
-                        for c in _fc_false:
-                            lines.append(f"  · {c['entity']}: 声称的与实测不符 → {c['actual']}")
-                    if _fc_unknown:
-                        lines.append("⚠️  [fact-check] 以下断言无法自动验证，请确认：")
-                        for c in _fc_unknown:
-                            lines.append(f"  · {c['claim']}")
-                    if lines:
-                        agent._safe_print("\n" + "\n".join(lines))
-        except Exception:
-            pass  # non-critical
-
     return finalize_turn(
         agent,
         final_response=final_response,
