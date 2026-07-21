@@ -6641,9 +6641,25 @@ def run_conversation(
                     if _msg.get("role") != "tool":
                         break
                     _content = _msg.get("content", "")
-                    if isinstance(_content, str) and _content.startswith("BLOCKED"):
-                        _user_blocked = True
-                        break
+                    if isinstance(_content, str):
+                        # Plain-text BLOCKED — terminal/file_tools/approval
+                        if _content.startswith("BLOCKED") or _content.startswith("[\"BLOCKED"):
+                            _user_blocked = True
+                            break
+                        # JSON-wrapped BLOCKED — execute_code returns
+                        # {"status":"error","error":"BLOCKED: ..."} when
+                        # the user denies via approval guard.  The plain-
+                        # text startswith check misses this path entirely.
+                        if _content.startswith("{"):
+                            try:
+                                parsed = json.loads(_content)
+                                if isinstance(parsed, dict):
+                                    error = parsed.get("error", "")
+                                    if isinstance(error, str) and error.startswith("BLOCKED"):
+                                        _user_blocked = True
+                                        break
+                            except (json.JSONDecodeError, TypeError):
+                                pass
                 if _user_blocked:
                     _turn_exit_reason = "user_blocked"
                     final_response = (
