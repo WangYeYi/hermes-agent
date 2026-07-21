@@ -72,8 +72,16 @@ def bind(a: "np.ndarray", b: "np.ndarray") -> "np.ndarray":
 
     Binding associates two concepts into a single composite vector.
     The result is dissimilar to both inputs (quasi-orthogonal).
+
+    Raises ValueError when vectors have different dimensions — this is a
+    programming error at the call site, not a recoverable runtime mismatch.
     """
     _require_numpy()
+    if a.shape != b.shape:
+        raise ValueError(
+            f"Vector dimension mismatch in bind(): {a.shape[0]} vs {b.shape[0]}. "
+            f"Both vectors must have the same hrr_dim."
+        )
     return (a + b) % _TWO_PI
 
 
@@ -82,8 +90,16 @@ def unbind(memory: "np.ndarray", key: "np.ndarray") -> "np.ndarray":
 
     Unbinding retrieves the value associated with a key from a memory vector.
     unbind(bind(a, b), a) ≈ b  (up to superposition noise)
+
+    Raises ValueError when vectors have different dimensions — this is a
+    programming error at the call site, not a recoverable runtime mismatch.
     """
     _require_numpy()
+    if memory.shape != key.shape:
+        raise ValueError(
+            f"Vector dimension mismatch in unbind(): {memory.shape[0]} vs {key.shape[0]}. "
+            f"Both vectors must have the same hrr_dim."
+        )
     return (memory - key) % _TWO_PI
 
 
@@ -92,8 +108,22 @@ def bundle(*vectors: "np.ndarray") -> "np.ndarray":
 
     Bundling merges multiple vectors into one that is similar to each input.
     The result can hold O(sqrt(dim)) items before similarity degrades.
+
+    Returns a zero-phase vector when no vectors are provided.
+
+    Raises ValueError when vectors have different dimensions — all bundled
+    vectors must share the same hrr_dim.
     """
     _require_numpy()
+    if not vectors:
+        return np.zeros(1, dtype=np.float64)
+    dim = vectors[0].shape[0]
+    for i, v in enumerate(vectors):
+        if v.shape[0] != dim:
+            raise ValueError(
+                f"Vector dimension mismatch in bundle(): vector[0]={dim} vs "
+                f"vector[{i}]={v.shape[0]}. All vectors must have the same hrr_dim."
+            )
     complex_sum = np.sum([np.exp(1j * v) for v in vectors], axis=0)
     return np.angle(complex_sum) % _TWO_PI
 
@@ -103,8 +133,13 @@ def similarity(a: "np.ndarray", b: "np.ndarray") -> float:
 
     Returns 1.0 for identical vectors, near 0.0 for random (unrelated) vectors,
     and -1.0 for perfectly anti-correlated vectors.
+
+    Returns 0.0 when vectors have different dimensions (graceful degradation
+    instead of crashing — dimension mismatch is not a semantic match).
     """
     _require_numpy()
+    if a.shape != b.shape:
+        return 0.0
     return float(np.mean(np.cos(a - b)))
 
 
@@ -174,6 +209,26 @@ def bytes_to_phases(data: bytes) -> "np.ndarray":
     """
     _require_numpy()
     return np.frombuffer(data, dtype=np.float64).copy()
+
+
+def safe_vec(data: bytes, expected_dim: int):
+    """Unpack a stored HRR vector and verify its dimension matches.
+
+    Returns the numpy array on success, ``None`` when the stored dimension
+    differs — the fact was encoded with a different ``hrr_dim`` and its
+    vector is not comparable to the current one.  Also returns ``None``
+    on deserialization errors (corrupt blob).
+
+    Callers should count skipped facts and log a warning suggesting
+    ``MemoryStore.rebuild_all_vectors()`` when mismatches are found.
+    """
+    try:
+        vec = bytes_to_phases(data)
+        if vec.shape[0] != expected_dim:
+            return None
+        return vec
+    except Exception:
+        return None
 
 
 def snr_estimate(dim: int, n_items: int) -> float:

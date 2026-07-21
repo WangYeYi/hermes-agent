@@ -7,6 +7,7 @@ Jaccard similarity reranking and trust-weighted scoring.
 from __future__ import annotations
 
 import math
+import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,11 @@ try:
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
 
+logger = logging.getLogger(__name__)
+
+# Re-export from the shared holographic module so store.py can also use it.
+_safe_vec = hrr.safe_vec
+
 
 class FactRetriever:
     """Multi-strategy fact retrieval with trust-weighted scoring."""
@@ -26,14 +32,29 @@ class FactRetriever:
         self,
         store: MemoryStore,
         temporal_decay_half_life: int = 0,  # days, 0 = disabled
-        fts_weight: float = 0.4,
-        jaccard_weight: float = 0.3,
-        hrr_weight: float = 0.3,
+        fts_weight: float = 0.35,
+        jaccard_weight: float = 0.25,
+        hrr_weight: float = 0.25,
+        onnx_weight: float = 0.15,
         hrr_dim: int = 1024,
     ):
         self.store = store
         self.half_life = temporal_decay_half_life
         self.hrr_dim = hrr_dim
+
+        # Lazy-load ONNX embedder for semantic similarity
+        self._onnx = None
+        self._onnx_available = False
+        if onnx_weight > 0:
+            try:
+                try:
+                    from .onnx_embed import OnnxEmbedder
+                except ImportError:
+                    from onnx_embed import OnnxEmbedder
+                self._onnx = OnnxEmbedder()
+                self._onnx_available = self._onnx.available
+            except Exception:
+                onnx_weight = 0.0
 
         # Auto-redistribute weights if numpy unavailable
         if hrr_weight > 0 and not hrr._HAS_NUMPY:
@@ -44,6 +65,30 @@ class FactRetriever:
         self.fts_weight = fts_weight
         self.jaccard_weight = jaccard_weight
         self.hrr_weight = hrr_weight
+        self.onnx_weight = onnx_weight
+
+        # Track dimension mismatches for migration guidance.
+        self._mismatch_count: int = 0
+        self._mismatch_warned: bool = False
+
+    def _skip_dim_mismatch(self):
+        """Increment the mismatch counter and log a one-time warning.
+
+        Call this whenever ``_safe_vec`` returns ``None`` so the operator
+        knows their search results are degraded and can run
+        ``rebuild_all_vectors()`` to migrate.
+        """
+        self._mismatch_count += 1
+        if not self._mismatch_warned:
+            self._mismatch_warned = True
+            logger.warning(
+                "Holographic dimension mismatch detected — one or more stored "
+                "facts were encoded with a different hrr_dim and are being "
+                "skipped during retrieval (%d skipped so far). "
+                "Run MemoryStore.rebuild_all_vectors() to migrate all facts "
+                "to the current hrr_dim and restore full search coverage.",
+                self._mismatch_count,
+            )
 
     def search(
         self,
@@ -68,9 +113,17 @@ class FactRetriever:
         if not candidates:
             return []
 
-        # Stage 2: Rerank with Jaccard + trust + optional decay
+        # Stage 2: Rerank with Jaccard + ONNX + HRR + trust + optional decay
         query_tokens = self._tokenize(query)
         scored = []
+
+        # Pre-compute ONNX query embedding if available
+        query_onnx_vec = None
+        if self.onnx_weight > 0 and self._onnx_available:
+            try:
+                query_onnx_vec = self._onnx.embed(query)
+            except Exception:
+                pass
 
         for fact in candidates:
             content_tokens = self._tokenize(fact["content"])
@@ -82,16 +135,32 @@ class FactRetriever:
 
             # HRR similarity
             if self.hrr_weight > 0 and fact.get("hrr_vector"):
-                fact_vec = hrr.bytes_to_phases(fact["hrr_vector"])
-                query_vec = hrr.encode_text(query, self.hrr_dim)
-                hrr_sim = (hrr.similarity(query_vec, fact_vec) + 1.0) / 2.0  # shift to [0,1]
+                fact_vec = _safe_vec(fact["hrr_vector"], self.hrr_dim)
+                if fact_vec is not None:
+                    query_vec = hrr.encode_text(query, self.hrr_dim)
+                    hrr_sim = (hrr.similarity(query_vec, fact_vec) + 1.0) / 2.0  # shift to [0,1]
+                else:
+                    hrr_sim = 0.5  # dimension mismatch — treat as neutral
+                    self._skip_dim_mismatch()
             else:
                 hrr_sim = 0.5  # neutral
 
-            # Combine FTS5 + Jaccard + HRR
+            # ONNX semantic similarity (bge-small-zh-v1.5, Chinese-optimized)
+            onnx_sim = 0.5  # neutral default
+            if self.onnx_weight > 0 and query_onnx_vec is not None and fact.get("onnx_vector"):
+                try:
+                    import numpy as np
+                    fact_onnx = np.frombuffer(fact["onnx_vector"], dtype=np.float32)
+                    onnx_sim = float(np.dot(query_onnx_vec, fact_onnx))
+                    onnx_sim = (onnx_sim + 1.0) / 2.0  # shift to [0,1]
+                except Exception:
+                    pass
+
+            # Combine FTS5 + Jaccard + HRR + ONNX
             relevance = (self.fts_weight * fts_score
                         + self.jaccard_weight * jaccard
-                        + self.hrr_weight * hrr_sim)
+                        + self.hrr_weight * hrr_sim
+                        + self.onnx_weight * onnx_sim)
 
             # Trust weighting
             score = relevance * fact["trust_score"]
@@ -144,7 +213,10 @@ class FactRetriever:
                 (bank_name,),
             ).fetchone()
             if bank_row:
-                bank_vec = hrr.bytes_to_phases(bank_row["vector"])
+                bank_vec = _safe_vec(bank_row["vector"], self.hrr_dim)
+                if bank_vec is None:
+                    self._skip_dim_mismatch()
+                    return []  # dimension mismatch — cannot compute
                 extracted = hrr.unbind(bank_vec, probe_key)
                 # Use extracted signal to score individual facts
                 return self._score_facts_by_vector(
@@ -176,7 +248,10 @@ class FactRetriever:
         scored = []
         for row in rows:
             fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
+            fact_vec = _safe_vec(fact.pop("hrr_vector"), self.hrr_dim)
+            if fact_vec is None:
+                self._skip_dim_mismatch()
+                continue  # dimension mismatch
             # Unbind probe key from fact to see if entity is structurally present
             residual = hrr.unbind(fact_vec, probe_key)
             # Compare residual against content signal
@@ -237,7 +312,10 @@ class FactRetriever:
         scored = []
         for row in rows:
             fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
+            fact_vec = _safe_vec(fact.pop("hrr_vector"), self.hrr_dim)
+            if fact_vec is None:
+                self._skip_dim_mismatch()
+                continue  # dimension mismatch
 
             # Check structural similarity: unbind entity from fact
             residual = hrr.unbind(fact_vec, entity_vec)
@@ -320,7 +398,10 @@ class FactRetriever:
         scored = []
         for row in rows:
             fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
+            fact_vec = _safe_vec(fact.pop("hrr_vector"), self.hrr_dim)
+            if fact_vec is None:
+                self._skip_dim_mismatch()
+                continue  # dimension mismatch
 
             entity_scores = []
             for probe_key in entity_residuals:
@@ -417,8 +498,11 @@ class FactRetriever:
                     continue  # Not enough entity overlap to be contradictory
 
                 # Content similarity via HRR vectors
-                v1 = hrr.bytes_to_phases(f1["hrr_vector"])
-                v2 = hrr.bytes_to_phases(f2["hrr_vector"])
+                v1 = _safe_vec(f1["hrr_vector"], self.hrr_dim)
+                v2 = _safe_vec(f2["hrr_vector"], self.hrr_dim)
+                if v1 is None or v2 is None:
+                    self._skip_dim_mismatch()
+                    continue  # dimension mismatch
                 content_sim = hrr.similarity(v1, v2)
 
                 # High entity overlap + low content similarity = potential contradiction
@@ -470,7 +554,10 @@ class FactRetriever:
         scored = []
         for row in rows:
             fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
+            fact_vec = _safe_vec(fact.pop("hrr_vector"), self.hrr_dim)
+            if fact_vec is None:
+                self._skip_dim_mismatch()
+                continue  # dimension mismatch
             sim = hrr.similarity(target_vec, fact_vec)
             fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
             scored.append(fact)
