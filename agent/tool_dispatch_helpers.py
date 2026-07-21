@@ -461,9 +461,6 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
 # model moves on to a genuinely new tool call.
 _TOOL_RESULT_DEDUP_CACHE: dict = {}
 _TOOL_RESULT_DEDUP_MAX_SIZE = 64
-# 累计节省统计
-_DEDUP_TOTAL_SAVED_CHARS = 0
-_DEDUP_TOTAL_HITS = 0
 
 
 def _dedup_tool_result(name: str, content: Any) -> str | None:
@@ -476,7 +473,6 @@ def _dedup_tool_result(name: str, content: Any) -> str | None:
     is recognised as a superset read and summarised with only the new
     lines appended.
     """
-    global _DEDUP_TOTAL_SAVED_CHARS, _DEDUP_TOTAL_HITS
     if not isinstance(content, str):
         return None
     if len(_TOOL_RESULT_DEDUP_CACHE) >= _TOOL_RESULT_DEDUP_MAX_SIZE:
@@ -487,19 +483,9 @@ def _dedup_tool_result(name: str, content: Any) -> str | None:
 
     # Exact duplicate?
     if cache_key in _TOOL_RESULT_DEDUP_CACHE:
-        # ~4 chars/token for English, ~1.5 for Chinese; use 3 as estimate
-        saved_tokens = max(1, len(content) // 3)
-        _DEDUP_TOTAL_SAVED_CHARS += len(content)
-        _DEDUP_TOTAL_HITS += 1
-        logger.info(
-            "dedup hit #%d: %s exact duplicate — %d chars (~%d tokens) saved "
-            "(cumulative: %d chars, ~%d tokens)",
-            _DEDUP_TOTAL_HITS, name, len(content), saved_tokens,
-            _DEDUP_TOTAL_SAVED_CHARS, max(1, _DEDUP_TOTAL_SAVED_CHARS // 3),
-        )
         return (
             f"[content unchanged from previous identical call"
-            f" — {len(content)} chars (~{saved_tokens} tokens saved)]"
+            f" — {len(content)} chars]"
         )
 
     # Offset-aware overlap (read_file only)
@@ -512,18 +498,6 @@ def _dedup_tool_result(name: str, content: Any) -> str | None:
                     continue
                 if content.startswith(_cc):
                     new_chars = len(content) - len(_cc)
-                    saved_chars = len(_cc)  # overlapping portion not resent
-                    saved_tokens = max(1, saved_chars // 3)
-                    _DEDUP_TOTAL_SAVED_CHARS += saved_chars
-                    _DEDUP_TOTAL_HITS += 1
-                    logger.info(
-                        "dedup hit #%d: read_file offset overlap — "
-                        "%d chars overlapped (~%d tokens), %d new chars "
-                        "(cumulative: %d chars, ~%d tokens)",
-                        _DEDUP_TOTAL_HITS, saved_chars, saved_tokens, new_chars,
-                        _DEDUP_TOTAL_SAVED_CHARS,
-                        max(1, _DEDUP_TOTAL_SAVED_CHARS // 3),
-                    )
                     return (
                         f"[content unchanged from previous read"
                         f" — first {len(_cc)} chars same,"
@@ -531,21 +505,9 @@ def _dedup_tool_result(name: str, content: Any) -> str | None:
                         f"{content[len(_cc):]}"
                     )
                 if _cc.startswith(content):
-                    saved_chars = len(content)
-                    saved_tokens = max(1, saved_chars // 3)
-                    _DEDUP_TOTAL_SAVED_CHARS += saved_chars
-                    _DEDUP_TOTAL_HITS += 1
-                    logger.info(
-                        "dedup hit #%d: read_file subset — "
-                        "%d chars (%s) fully covered by previous read "
-                        "(cumulative: %d chars, ~%d tokens)",
-                        _DEDUP_TOTAL_HITS, saved_chars, file_path,
-                        _DEDUP_TOTAL_SAVED_CHARS,
-                        max(1, _DEDUP_TOTAL_SAVED_CHARS // 3),
-                    )
                     return (
                         f"[content unchanged from previous read"
-                        f" — {len(content)} chars (~{saved_tokens} tokens saved)]"
+                        f" — {len(content)} chars]"
                     )
 
     # Store
