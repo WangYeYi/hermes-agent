@@ -320,6 +320,9 @@ class TestMakeToolResultMessage:
         assert "_tool_output_risk" not in non_text
 
     def test_scanner_failure_never_blocks_tool_output(self, monkeypatch):
+        from agent.tool_dispatch_helpers import _TOOL_RESULT_DEDUP_CACHE
+        _TOOL_RESULT_DEDUP_CACHE.clear()
+
         def fail_scan(*_args, **_kwargs):
             raise RuntimeError("scanner unavailable")
 
