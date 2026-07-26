@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -454,6 +455,108 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
     return msg
 
 
+# ── Tool-result dedup cache ──────────────────────────────────────────────
+# Avoids flooding the context window with repeated identical tool output.
+# Module-level so it persists across a single agent turn; cleared when the
+# model moves on to a genuinely new tool call.
+_TOOL_RESULT_DEDUP_CACHE: dict = {}
+_TOOL_RESULT_DEDUP_MAX_SIZE = 64
+# 累计节省统计
+_DEDUP_TOTAL_SAVED_CHARS = 0
+_DEDUP_TOTAL_HITS = 0
+
+
+def _dedup_tool_result(name: str, content: Any) -> str | None:
+    """Return a dedup summary if *content* is identical to or overlaps
+    with a previous tool result from the same tool, otherwise ``None``.
+
+    Plain-string content only — non-strings (images, dicts, etc.) pass
+    through.  read_file gets extra offset-aware overlap detection so that
+    ``read_file(offset=1,limit=500)`` → ``read_file(offset=1,limit=1000)``
+    is recognised as a superset read and summarised with only the new
+    lines appended.
+    """
+    global _DEDUP_TOTAL_SAVED_CHARS, _DEDUP_TOTAL_HITS
+    if not isinstance(content, str):
+        return None
+    if len(_TOOL_RESULT_DEDUP_CACHE) >= _TOOL_RESULT_DEDUP_MAX_SIZE:
+        _TOOL_RESULT_DEDUP_CACHE.clear()
+
+    content_hash = hashlib.sha256(content.encode()).hexdigest()
+    cache_key = (name, content_hash)
+
+    # Exact duplicate?
+    if cache_key in _TOOL_RESULT_DEDUP_CACHE:
+        # ~4 chars/token for English, ~1.5 for Chinese; use 3 as estimate
+        saved_tokens = max(1, len(content) // 3)
+        _DEDUP_TOTAL_SAVED_CHARS += len(content)
+        _DEDUP_TOTAL_HITS += 1
+        logger.info(
+            "dedup hit #%d: %s exact duplicate — %d chars (~%d tokens) saved "
+            "(cumulative: %d chars, ~%d tokens)",
+            _DEDUP_TOTAL_HITS, name, len(content), saved_tokens,
+            _DEDUP_TOTAL_SAVED_CHARS, max(1, _DEDUP_TOTAL_SAVED_CHARS // 3),
+        )
+        return (
+            f"[content unchanged from previous identical call"
+            f" — {len(content)} chars (~{saved_tokens} tokens saved)]"
+        )
+
+    # Offset-aware overlap (read_file only)
+    if name == "read_file":
+        path_match = re.search(r"^\s*(/\S+)", content, re.MULTILINE)
+        file_path = path_match.group(1) if path_match else None
+        if file_path:
+            for (_cn, _ch), (_cc, _cp) in list(_TOOL_RESULT_DEDUP_CACHE.items()):
+                if _cn != "read_file" or _cp != file_path:
+                    continue
+                if content.startswith(_cc):
+                    new_chars = len(content) - len(_cc)
+                    saved_chars = len(_cc)  # overlapping portion not resent
+                    saved_tokens = max(1, saved_chars // 3)
+                    _DEDUP_TOTAL_SAVED_CHARS += saved_chars
+                    _DEDUP_TOTAL_HITS += 1
+                    logger.info(
+                        "dedup hit #%d: read_file offset overlap — "
+                        "%d chars overlapped (~%d tokens), %d new chars "
+                        "(cumulative: %d chars, ~%d tokens)",
+                        _DEDUP_TOTAL_HITS, saved_chars, saved_tokens, new_chars,
+                        _DEDUP_TOTAL_SAVED_CHARS,
+                        max(1, _DEDUP_TOTAL_SAVED_CHARS // 3),
+                    )
+                    return (
+                        f"[content unchanged from previous read"
+                        f" — first {len(_cc)} chars same,"
+                        f" {new_chars} chars of new content follow]\n\n"
+                        f"{content[len(_cc):]}"
+                    )
+                if _cc.startswith(content):
+                    saved_chars = len(content)
+                    saved_tokens = max(1, saved_chars // 3)
+                    _DEDUP_TOTAL_SAVED_CHARS += saved_chars
+                    _DEDUP_TOTAL_HITS += 1
+                    logger.info(
+                        "dedup hit #%d: read_file subset — "
+                        "%d chars (%s) fully covered by previous read "
+                        "(cumulative: %d chars, ~%d tokens)",
+                        _DEDUP_TOTAL_HITS, saved_chars, file_path,
+                        _DEDUP_TOTAL_SAVED_CHARS,
+                        max(1, _DEDUP_TOTAL_SAVED_CHARS // 3),
+                    )
+                    return (
+                        f"[content unchanged from previous read"
+                        f" — {len(content)} chars (~{saved_tokens} tokens saved)]"
+                    )
+
+    # Store
+    file_path = None
+    if name == "read_file":
+        pm = re.search(r"^\s*(/\S+)", content, re.MULTILINE)
+        file_path = pm.group(1) if pm else None
+    _TOOL_RESULT_DEDUP_CACHE[cache_key] = (content, file_path)
+    return None
+
+
 def make_tool_result_message(
     name: str,
     content: Any,
@@ -481,6 +584,10 @@ def make_tool_result_message(
     callers should compare by value, not by ``is``.
     """
     wrapped = _maybe_wrap_untrusted(name, content)
+    # Dedup repeated identical tool output before building the message.
+    deduped = _dedup_tool_result(name, wrapped)
+    if deduped is not None:
+        wrapped = deduped
     message = {
         "role": "tool",
         "name": name,
