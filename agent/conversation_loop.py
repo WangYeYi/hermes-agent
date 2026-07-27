@@ -1112,9 +1112,20 @@ def _split_user_items(text: str) -> list[str]:
     segments = re.split(r'(?<=[。！？])\s*|\n+', text)
     segments = [s.strip().rstrip('。！？，,') for s in segments if len(s.strip().rstrip('。！？，,')) >= 3]
     if len(segments) < 2:
+        # Try transition words first
         sub = re.split(r'(?:还有|另外|以及|另外问|顺便|同时|此外|再加上|最后|然后)', text)
         sub = [s.strip().rstrip('，,') for s in sub if len(s.strip()) > 3]
-        return sub if len(sub) >= 2 else [text.strip()]
+        if len(sub) >= 2:
+            return sub
+        # Try comma-separated compound questions: "A，B，C？"
+        if "，" in text and "？" in text:
+            comma_parts = re.split(r'[，,]', text)
+            question_pattern = r'[？?吗呢]|怎么|如何|是不是|能不能|要不要|会不会|有没有|是否|怎样|几个|多少'
+            if sum(1 for p in comma_parts if re.search(question_pattern, p)) >= 1:
+                parts = [p.strip() for p in comma_parts if len(p.strip()) >= 3]
+                if len(parts) >= 2:
+                    return parts
+        return [text.strip()]
 
     result = []
     for seg in segments:
@@ -1122,6 +1133,24 @@ def _split_user_items(text: str) -> list[str]:
         for s in sub:
             s = s.strip()
             if len(s) >= 3:
+                # Split comma-separated compound questions.
+                # Pattern: "A，B，C？" where the last segment has a
+                # question marker or any segment uses interrogative
+                # words (怎么/如何/是不是/能不能/有没有/会不会).
+                if "，" in s or "？" in s:
+                    comma_parts = re.split(r'[，,]', s)
+                    # Only split if at least one part looks like a question
+                    question_pattern = r'[？?吗呢]|怎么|如何|是不是|能不能|要不要|会不会|有没有|是否|怎样|几个|多少'
+                    question_count = sum(
+                        1 for p in comma_parts
+                        if re.search(question_pattern, p)
+                    )
+                    if question_count >= 2 or (question_count >= 1 and s.rstrip().endswith("？")):
+                        for p in comma_parts:
+                            p = p.strip()
+                            if len(p) >= 3:
+                                result.append(p)
+                        continue
                 result.append(s)
     return result if len(result) >= 2 else [text.strip()]
 
@@ -1211,6 +1240,25 @@ def _run_output_guard(agent, final_response: str, original_user_message: Any) ->
     user_text = _flatten_user_text(original_user_message)
     if not user_text:
         return []
+
+    # Skip system-prompt fragments — skill curator instructions, memory
+    # review prompts, and other injected scaffolding are not real user
+    # questions and would produce massive false-positive missed-item lists
+    # (e.g. 34-item curator instructions checked against every answer).
+    _SYSTEM_PROMPT_PATTERNS = [
+        "Review the conversation above and update the skill",
+        "Target shape of the library",
+        "Signals to look for",
+        "Preference order",
+        "Protected skills",
+        "Do NOT capture",
+        "Based on the conversation above",
+        "Consider the following",
+        "Focus on:",
+    ]
+    if any(user_text.startswith(p) for p in _SYSTEM_PROMPT_PATTERNS):
+        return []
+
     items = _split_user_items(user_text)
     if len(items) < 2:
         return []
@@ -7303,6 +7351,23 @@ def run_conversation(
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
+
+    # ── Output guard: check coverage after turn completes ──
+    _guard_missing: list[int] = []
+    if (
+        final_response
+        and not final_response.startswith("I apologize")
+        and original_user_message is not None
+    ):
+        _guard_missing = _run_output_guard(
+            agent, final_response, original_user_message
+        )
+        if _guard_missing:
+            items_str = "、".join(f"第{i}条" for i in _guard_missing)
+            agent._safe_print(
+                f"\n⚠️  [output-guard] 检测到遗漏 {items_str}，已追加提醒"
+            )
+
     return finalize_turn(
         agent,
         final_response=final_response,
