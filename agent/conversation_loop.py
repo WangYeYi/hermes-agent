@@ -1051,14 +1051,14 @@ def _guard_write_log(entry: dict) -> None:
     try:
         os.makedirs(os.path.dirname(_GUARD_LOG_PATH), exist_ok=True)
         now = time.time()
-        with open(_GUARD_LOG_PATH, "a") as f:
+        with open(_GUARD_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         # 低频清理：每小时最多一次
         if os.path.getmtime(_GUARD_LOG_PATH) < now - 3600:
             cutoff = now - _GUARD_LOG_MAX_AGE
             try:
                 tmp = _GUARD_LOG_PATH + ".tmp"
-                with open(_GUARD_LOG_PATH) as fin, open(tmp, "w") as fout:
+                with open(_GUARD_LOG_PATH, encoding="utf-8") as fin, open(tmp, "w", encoding="utf-8") as fout:
                     for line in fin:
                         try:
                             e = json.loads(line)
