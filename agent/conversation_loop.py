@@ -5452,6 +5452,9 @@ def run_conversation(
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
+            # Save streamed text before streaming lifecycle clears it (line 5190 in run_agent.py).
+            # Used as fallback for re-emit when assistant_message.content is null.
+            agent._saved_streamed_text = getattr(agent, "_current_streamed_assistant_text", "") or ""
             finish_reason = normalized.finish_reason
             
             # Normalize content to string — some OpenAI-compatible servers
@@ -5975,8 +5978,8 @@ def run_conversation(
                 # answer and calls memory/skill tools as a side-effect in the same
                 # turn. If the follow-up turn after tools is empty, we use this.
                 # DeepSeek/OpenAI may return content:null with tool_calls even
-                # though text was streamed — fall back to accumulated streamed text.
-                _streamed_text = getattr(agent, "_current_streamed_assistant_text", "") or ""
+                # though text was streamed — fall back to saved streamed text.
+                _streamed_text = getattr(agent, "_saved_streamed_text", "") or getattr(agent, "_current_streamed_assistant_text", "") or ""
                 _effective_content = turn_content or _streamed_text
                 if _effective_content and agent._has_content_after_think_block(_effective_content):
                     agent._last_content_with_tools = turn_content
@@ -6316,8 +6319,8 @@ def run_conversation(
                 # tool calls remain visible.  Skip housekeeping-only turns
                 # — their text was already shown via _vprint at line 5007.
                 # DeepSeek/OpenAI may return content:null with tool_calls —
-                # fall back to accumulated streamed text.
-                _streamed_text = getattr(agent, "_current_streamed_assistant_text", "") or ""
+                # fall back to saved streamed text (captured before streaming cleared it).
+                _streamed_text = getattr(agent, "_saved_streamed_text", "") or getattr(agent, "_current_streamed_assistant_text", "") or ""
                 _effective_content = turn_content or _streamed_text
                 if (
                     _effective_content
