@@ -6235,7 +6235,11 @@ def run_conversation(
                 # as a fallback final response. Common pattern: model delivers its
                 # answer and calls memory/skill tools as a side-effect in the same
                 # turn. If the follow-up turn after tools is empty, we use this.
-                if turn_content and agent._has_content_after_think_block(turn_content):
+                # DeepSeek/OpenAI may return content:null with tool_calls even
+                # though text was streamed — fall back to accumulated streamed text.
+                _streamed_text = getattr(agent, "_current_streamed_assistant_text", "") or ""
+                _effective_content = turn_content or _streamed_text
+                if _effective_content and agent._has_content_after_think_block(_effective_content):
                     agent._last_content_with_tools = turn_content
                     # Only mute subsequent output when EVERY tool call in
                     # this turn is post-response housekeeping (memory, todo,
@@ -6575,14 +6579,16 @@ def run_conversation(
                 # — their text was already shown via _vprint at line 5007.
                 # Skip quiet/suppress modes — the re-emit is only useful
                 # for interactive CLI where the user is watching.
+                _streamed_text = getattr(agent, "_current_streamed_assistant_text", "") or ""
+                _effective_content = turn_content or _streamed_text
                 if (
-                    turn_content
-                    and agent._has_content_after_think_block(turn_content)
+                    _effective_content
+                    and agent._has_content_after_think_block(_effective_content)
                     and not _all_housekeeping
                     and not agent.quiet_mode
                     and not getattr(agent, "suppress_status_output", False)
                 ):
-                    _clean = agent._strip_think_blocks(turn_content).strip()
+                    _clean = agent._strip_think_blocks(_effective_content).strip()
                     if _clean:
                         agent._safe_print(f"\n💬 {_clean}")
                 else:
