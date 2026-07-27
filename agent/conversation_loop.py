@@ -1003,7 +1003,7 @@ def _split_user_items(text: str) -> list[str]:
         if len(sub) >= 2:
             return sub
         # Try comma-separated compound questions: "A，B，C？"
-        if "，" in text and "？" in text:
+        if "，" in text and re.search(r'[？?吗呢]|怎么|如何|是不是|能不能', text):
             comma_parts = re.split(r'[，,]', text)
             question_pattern = r'[？?吗呢]|怎么|如何|是不是|能不能|要不要|会不会|有没有|是否|怎样|几个|多少'
             if sum(1 for p in comma_parts if re.search(question_pattern, p)) >= 1:
