@@ -7875,6 +7875,13 @@ def _update_via_zip(args):
         _print_curator_recent_run_notice()
     except Exception as e:
         logger.debug("Curator recent-run notice failed: %s", e)
+    # 更新后自动验证本地补丁（任何路径、任何触发方式都覆盖）
+    try:
+        _verify_script = os.path.expanduser("~/.hermes/scripts/verify-patches.sh")
+        if os.path.exists(_verify_script):
+            subprocess.run(["bash", _verify_script], check=False, timeout=30)
+    except Exception as e:
+        logger.debug("Patch verification failed: %s", e)
     # Don't stop a working dashboard when the Node refresh failed — see the
     # git-update path for rationale (#30271).
     _finish_dashboard_update_cleanup(node_failures)
