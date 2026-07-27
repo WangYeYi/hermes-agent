@@ -1241,7 +1241,17 @@ def _run_output_guard(agent, final_response: str, original_user_message: Any) ->
             for r in l2_results
             if not r.get("covered")
         ]
-        uncertain_for_l3 = list(dict.fromkeys(l2_missed + missed))  # 合并去重
+        # L2 判 covered 但 sim 低于不确定阈值的条目也送 L3
+        # （MiniLM 68% 准确率不可靠，低 sim 的"covered"可能是误判）
+        UNCERTAIN_SIM = 0.25
+        l2_uncertain = [
+            remaining[r["index"] - 1]
+            for r in l2_results
+            if r.get("covered") and r.get("similarity", 0) < UNCERTAIN_SIM
+        ]
+        log_entry["l2"]["uncertain_threshold"] = UNCERTAIN_SIM
+        log_entry["l2"]["uncertain_indices"] = l2_uncertain
+        uncertain_for_l3 = list(dict.fromkeys(l2_missed + l2_uncertain + missed))  # 合并去重
 
     if not uncertain_for_l3:
         _guard_write_log(log_entry)
