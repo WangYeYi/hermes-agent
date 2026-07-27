@@ -5286,6 +5286,7 @@ class AIAgent:
                     except Exception:
                         pass
                 self._record_streamed_assistant_text(tail)
+        self._saved_streamed_text = getattr(self, "_current_streamed_assistant_text", "") or ""
         self._current_streamed_assistant_text = ""
         self._current_streamed_reasoning_text = ""
 
