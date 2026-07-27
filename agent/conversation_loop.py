@@ -6040,7 +6040,7 @@ def run_conversation(
                 # tool calls remain visible.  Skip housekeeping-only turns
                 # — their text was already shown via _vprint at line 5007.
                 # DeepSeek/OpenAI may return content:null with tool_calls —
-                # fall back to accumulated streamed text from _current_streamed_assistant_text.
+                # fall back to accumulated streamed text.
                 _streamed_text = getattr(agent, "_current_streamed_assistant_text", "") or ""
                 _effective_content = turn_content or _streamed_text
                 if (
