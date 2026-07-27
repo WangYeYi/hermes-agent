@@ -6501,6 +6501,21 @@ def run_conversation(
                     _clean = agent._strip_think_blocks(turn_content).strip()
                     if _clean:
                         agent._safe_print(f"\n💬 {_clean}")
+                else:
+                    # 诊断：记录为什么 re-emit 被跳过
+                    _skip_reasons = []
+                    if not turn_content:
+                        _skip_reasons.append("turn_content_empty")
+                    elif not agent._has_content_after_think_block(turn_content):
+                        _skip_reasons.append("no_content_after_think")
+                    if _all_housekeeping:
+                        _skip_reasons.append("all_housekeeping")
+                    if agent.quiet_mode:
+                        _skip_reasons.append("quiet_mode")
+                    if getattr(agent, "suppress_status_output", False):
+                        _skip_reasons.append("suppress_status_output")
+                    if _skip_reasons:
+                        logger.debug("re-emit skipped: %s", ",".join(_skip_reasons))
                 # Continue loop for next response
                 continue
             
