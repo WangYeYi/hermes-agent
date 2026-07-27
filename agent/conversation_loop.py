@@ -7178,6 +7178,34 @@ def run_conversation(
                 f"\n⚠️  [output-guard] 检测到遗漏 {items_str}，已追加提醒"
             )
 
+    # ── Factual claim verification: MiniLM claim detection + gh/shell cross-check ──
+    if final_response and not final_response.startswith("I apologize"):
+        try:
+            import subprocess as _fc_sp
+            _fc_result = _fc_sp.run(
+                ["python3", os.path.expanduser("~/.hermes/scripts/verify_factual_claims.py")],
+                input=final_response, capture_output=True, timeout=15, text=True
+            )
+            if _fc_result.returncode == 0:
+                _fc_claims = json.loads(_fc_result.stdout)
+                if _fc_claims:
+                    # Separate verified false claims from unverifiable ones
+                    _fc_false = [c for c in _fc_claims if c.get("entity") != "?"]
+                    _fc_unknown = [c for c in _fc_claims if c.get("entity") == "?"]
+                    lines = []
+                    if _fc_false:
+                        lines.append("⚠️  [fact-check] 以下断言与实际情况不符：")
+                        for c in _fc_false:
+                            lines.append(f"  · {c['entity']}: 声称的与实测不符 → {c['actual']}")
+                    if _fc_unknown:
+                        lines.append("⚠️  [fact-check] 以下断言无法自动验证，请确认：")
+                        for c in _fc_unknown:
+                            lines.append(f"  · {c['claim']}")
+                    if lines:
+                        agent._safe_print("\n" + "\n".join(lines))
+        except Exception:
+            pass  # non-critical
+
     return finalize_turn(
         agent,
         final_response=final_response,
