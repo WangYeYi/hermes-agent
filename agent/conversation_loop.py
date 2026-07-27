@@ -6493,15 +6493,14 @@ def run_conversation(
                 # Reprinting it here ensures short answers placed before
                 # tool calls remain visible.  Skip housekeeping-only turns
                 # — their text was already shown via _vprint at line 5007.
-                # Skip quiet/suppress modes — the re-emit is only useful
-                # for interactive CLI where the user is watching.
+                # DeepSeek/OpenAI may return content:null with tool_calls —
+                # fall back to accumulated streamed text from _current_streamed_assistant_text.
                 _streamed_text = getattr(agent, "_current_streamed_assistant_text", "") or ""
                 _effective_content = turn_content or _streamed_text
                 if (
                     _effective_content
                     and agent._has_content_after_think_block(_effective_content)
                     and not _all_housekeeping
-                    and not agent.quiet_mode
                     and not getattr(agent, "suppress_status_output", False)
                 ):
                     _clean = agent._strip_think_blocks(_effective_content).strip()
