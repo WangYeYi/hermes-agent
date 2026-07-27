@@ -622,6 +622,13 @@ def apply_wal_with_fallback(
     _on_disk_journal_mode.  That holds for both the NFS path and the
     WAL-reset vulnerability path.
     """
+    # HERMES_NO_WAL: skip WAL entirely, use TRUNCATE mode.
+    # Prevents data loss on hard shutdowns (e.g. wsl --shutdown)
+    # where WAL frames not yet checkpointed are discarded.
+    if os.environ.get('HERMES_NO_WAL') == '1':
+        conn.execute('PRAGMA journal_mode=TRUNCATE')
+        return 'truncate'
+
     # Vulnerable SQLite: do not enable WAL on new/non-WAL files.
     if is_sqlite_wal_reset_vulnerable():
         return _apply_delete_for_wal_reset_bug(conn, db_label=db_label)
