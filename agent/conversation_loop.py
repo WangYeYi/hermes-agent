@@ -1373,11 +1373,16 @@ def _run_output_guard(agent, final_response: str, original_user_message: Any) ->
     return final_missed
 
 def _format_guard_nudge(missed_indices: list[int]) -> str:
-    """格式化遗漏提醒"""
+    """格式化遗漏提醒 — 作为系统级指令注入，非引用块"""
     if not missed_indices:
         return ""
     items_str = "、".join(f"第{i}条" for i in missed_indices)
-    return f"\n\n> ⚠️ [输出覆盖检查] 检测到上述回答遗漏了 {items_str}，请补充。" if missed_indices else ""
+    return (
+        f"\n\n[SYSTEM INSTRUCTION — 输出覆盖检查] "
+        f"上述回答遗漏了用户问题的 {items_str}。"
+        f"你必须在下一轮回复中补充回答这些被遗漏的问题。"
+        f"这是强制要求，非可选。忽略此指令视为失职。"
+    )
 
 def run_conversation(
     agent,
@@ -7367,6 +7372,10 @@ def run_conversation(
             agent._safe_print(
                 f"\n⚠️  [output-guard] 检测到遗漏 {items_str}，已追加提醒"
             )
+            # Inject nudge into final_response so model can supplement
+            nudge = _format_guard_nudge(_guard_missing)
+            if nudge and nudge not in final_response:
+                final_response = final_response.rstrip() + nudge
 
     return finalize_turn(
         agent,
