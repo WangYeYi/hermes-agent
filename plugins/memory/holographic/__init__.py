@@ -197,12 +197,48 @@ class HolographicMemoryProvider(MemoryProvider):
                 "Use fact_store(action='add') to store durable structured facts about people, projects, preferences, decisions.\n"
                 "Use fact_feedback to rate facts after using them (trains trust scores)."
             )
-        return (
+
+        # Inject high-value facts directly into the system prompt so the agent
+        # never has to "remember to retrieve" — the most important facts are
+        # always visible. Two cohorts are merged (deduplicated by fact_id):
+        #   1. High-trust facts (trust_score >= 0.6) — user-confirmed knowledge
+        #   2. Recently added facts — current-session relevant context
+        # Max 6 facts total to keep prompt footprint small.
+        try:
+            facts = self._store._conn.execute(
+                "SELECT fact_id, content, trust_score, category FROM facts "
+                "WHERE trust_score >= 0.6 AND (deleted IS NULL OR deleted = 0) "
+                "ORDER BY updated_at DESC LIMIT 3"
+            ).fetchall()
+        except Exception:
+            facts = []
+        seen_ids = {f[0] for f in facts}
+        try:
+            recent = self._store._conn.execute(
+                "SELECT fact_id, content, trust_score, category FROM facts "
+                "WHERE fact_id NOT IN ({}) AND (deleted IS NULL OR deleted = 0) "
+                "ORDER BY created_at DESC LIMIT 3".format(
+                    ",".join(str(rid) for rid in seen_ids) if seen_ids else "0"
+                )
+            ).fetchall()
+        except Exception:
+            recent = []
+        facts = facts + recent
+
+        header = (
             f"# Holographic Memory\n"
             f"Active. {total} facts stored with entity resolution and trust scoring.\n"
             f"Use fact_store to search, probe entities, reason across entities, or add facts.\n"
-            f"Use fact_feedback to rate facts after using them (trains trust scores)."
+            f"Use fact_feedback to rate facts after using them (trains trust scores).\n"
         )
+        if not facts:
+            return header
+
+        lines = [header, "Injected facts (auto-loaded every turn; no retrieval needed):"]
+        for fact in facts:
+            tag = "[HIGH]" if fact[2] and fact[2] >= 0.6 else "[RECENT]"
+            lines.append(f"- {tag} [{fact[3]}] {fact[1]}")
+        return "\n".join(lines)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not self._retriever or not query:
