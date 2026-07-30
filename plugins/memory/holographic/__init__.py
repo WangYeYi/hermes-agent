@@ -107,6 +107,24 @@ def _load_plugin_config() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _replace_entity_value(content: str, entity: str, old_val: str, new_val: str) -> str:
+    """Replace an entity's old value with a new value in a fact content string.
+
+    Handles common patterns: '端口:7890', '端口是7890', '端口=7890', '端口 7890'.
+    Only replaces the value when the entity name precedes it.
+    """
+    import re as _re
+    pattern = _re.compile(
+        _re.escape(entity) + r'\s*[:：=是]?\s*' + _re.escape(old_val),
+    )
+    replacement = f"{entity}:{new_val}"
+    return pattern.sub(replacement, content, count=1)
+
+
+# ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
 
@@ -220,9 +238,414 @@ class HolographicMemoryProvider(MemoryProvider):
             return ""
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        # Holographic memory stores explicit facts via tools, not auto-sync.
-        # The on_session_end hook handles auto-extraction if configured.
-        pass
+        """Track fact mentions and corrections in user dialogue.
+
+        Four functions:
+        1. _track_mentions(): detect existing facts in user message, boost trust.
+        2. _detect_corrections(): detect when user corrects a stored fact, flag
+           for resolution (trust -= 0.05 pre-penalty until verified).
+        3. _incremental_extract(): when auto_extract is on, harvest seed facts.
+        4. resolve_contradiction(): called by agent after verifying correction —
+           correct fact boosted, wrong fact demoted or deleted.
+        """
+        if not self._store or not user_content:
+            return
+        self._track_mentions(user_content)
+        self._detect_corrections(user_content)
+        if is_truthy_value(self._config.get("auto_extract", False)):
+            self._incremental_extract(user_content)
+
+    def _track_mentions(self, user_content: str) -> int:
+        """Detect which existing facts are mentioned in user message, auto-weight.
+
+        Two-layer matching (mutually exclusive, L1 preferred):
+        L1: Jaccard token overlap (fast, free, exact keyword matching)
+        L2: ONNX semantic similarity (Chinese-optimized, fallback when L1 empty)
+
+        Each hit: trust_score += 0.02 (capped at 1.0), mention_count += 1,
+                  last_mentioned_at = NOW, updated_at = NOW.
+
+        Returns number of facts whose trust_score was incremented.
+        """
+        from .retrieval import FactRetriever
+
+        conn = self._store._conn
+        rows = conn.execute(
+            "SELECT fact_id, content, trust_score, tags FROM facts "
+            "ORDER BY trust_score DESC LIMIT 200"
+        ).fetchall()
+
+        if not rows:
+            return 0
+
+        user_tokens = FactRetriever._tokenize(user_content)
+        if len(user_tokens) < 3:
+            return 0  # Too short to meaningfully match
+
+        # L1: Jaccard token overlap
+        l1_hits = []
+        for row in rows:
+            fact_id, content, trust, tags = row
+            content_tokens = FactRetriever._tokenize(content)
+            tag_tokens = FactRetriever._tokenize(tags or "")
+            all_fact_tokens = content_tokens | tag_tokens
+
+            intersection = len(user_tokens & all_fact_tokens)
+            union = len(user_tokens | all_fact_tokens)
+            jaccard = intersection / union if union > 0 else 0.0
+
+            if jaccard >= 0.15 and intersection >= 3:
+                l1_hits.append((fact_id, trust))
+
+        # L2: ONNX semantic (only if L1 found nothing — avoid unnecessary cost)
+        if not l1_hits and self._retriever and getattr(self._retriever, '_onnx_available', False):
+            try:
+                onnx = self._retriever._onnx
+                if onnx is None:
+                    return 0
+                query_vec = onnx.embed(user_content)
+                import numpy as np
+                query_norm = np.linalg.norm(query_vec)
+                if query_norm == 0:
+                    return 0
+                for row in rows:
+                    fact_id, content, trust, tags = row
+                    raw = conn.execute(
+                        "SELECT onnx_vector FROM facts WHERE fact_id = ?", (fact_id,)
+                    ).fetchone()
+                    if not raw or not raw[0]:
+                        continue
+                    fact_vec = np.frombuffer(raw[0], dtype=np.float32)
+                    fact_norm = np.linalg.norm(fact_vec)
+                    if fact_norm == 0:
+                        continue
+                    sim = float(np.dot(query_vec, fact_vec) / (query_norm * fact_norm))
+                    if sim >= 0.75:
+                        l1_hits.append((fact_id, trust))
+            except Exception:
+                pass
+
+        # Apply weight increments
+        updated = 0
+        for fact_id, current_trust in l1_hits:
+            new_trust = min(1.0, current_trust + 0.02)
+            if new_trust > current_trust:
+                conn.execute(
+                    """UPDATE facts SET
+                       trust_score = ?,
+                       mention_count = mention_count + 1,
+                       last_mentioned_at = CURRENT_TIMESTAMP,
+                       updated_at = CURRENT_TIMESTAMP
+                    WHERE fact_id = ?""",
+                    (new_trust, fact_id),
+                )
+                updated += 1
+
+        if updated:
+            conn.commit()
+
+        return updated
+
+    # ------------------------------------------------------------------
+    # Correction / contradiction detection
+    # ------------------------------------------------------------------
+
+    # Patterns that indicate the user is correcting a previous claim
+    _CORRECTION_PATTERNS = [
+        # Chinese: "不是X是Y", "X不对，应该是Y", "错了", "正确的是"
+        re.compile(r'(?:不是|不对|错了|错误的?).{0,20}(?:是|应该是|正确的是|而是)\s*(.+)'),
+        re.compile(r'(.{3,40})\s*(?:不对|错了|不正确|是错的)'),
+        re.compile(r'(?:正确的是|应该是|其实是|实际是|真正的?)\s*(.+)'),
+        re.compile(r'(?:你又用|你又|你).{0,5}(?:猜测|编造|乱答|瞎猜)'),
+        re.compile(r'(?:之前|上次|前面).{0,10}(?:说的?|给的?).{0,10}(?:不对|错了|有问题)'),
+        # Direct value flip: "端口是7897" vs stored "端口7890"
+        re.compile(r'(?:端口|地址|路径|账号|密码|密钥|key|token|port|host|url)\S{0,3}(?:是|为|改|换|用|设)\s*[:：]?\s*(\S+)'),
+        # English
+        re.compile(r"(?:that's|that is|you're|you are)\s+(?:wrong|incorrect|mistaken)", re.IGNORECASE),
+        re.compile(r"(?:it should be|the correct|actually)\s+(.+)", re.IGNORECASE),
+    ]
+
+    # Entity-value patterns for contradiction matching within facts
+    # The value capture stops at Chinese/English punctuation or whitespace
+    _ENTITY_VALUE_RE = re.compile(
+        r'(端口|地址|路径|账号|密码|密钥|key|token|port|host|url|proxy|代理|版本|version|端口号)'
+        r'\S{0,3}(?:是|为|:|：|＝|=)\s*([a-zA-Z0-9._-]+)',
+        re.IGNORECASE
+    )
+
+    def _detect_corrections(self, user_content: str) -> int:
+        """Detect user corrections and auto-resolve when the new value is clear.
+
+        Two-tier resolution:
+        1. AUTO-RESOLVE: if the user provides a clear entity-value correction
+           (e.g. "端口是7897，之前7890错了"), update the fact content with the
+           new value immediately. No agent involvement needed.
+        2. PRE-PENALTY: if a correction signal is detected but the corrected
+           value is ambiguous (token overlap fallback), flag with pre-penalty
+           trust -= 0.05 for later resolution.
+
+        Returns number of facts processed (flagged or auto-resolved).
+        """
+        if not self._store or len(user_content) < 8:
+            return 0
+
+        # First: check if any correction pattern matches
+        correction_signal = False
+        corrected_value = None
+        for pat in self._CORRECTION_PATTERNS:
+            m = pat.search(user_content)
+            if m:
+                correction_signal = True
+                groups = m.groups()
+                if groups and groups[0]:
+                    corrected_value = groups[0].strip()
+                    if len(corrected_value) > 60:
+                        corrected_value = corrected_value[:60]
+                break
+
+        if not correction_signal:
+            return 0
+
+        conn = self._store._conn
+        rows = conn.execute(
+            "SELECT fact_id, content, trust_score, tags FROM facts "
+            "WHERE trust_score >= 0.3 AND tags NOT LIKE '%correction:resolved%' "
+            "ORDER BY trust_score DESC LIMIT 100"
+        ).fetchall()
+
+        processed = 0
+        auto_resolved = 0
+        user_tokens = set(re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z0-9_-]+', user_content.lower()))
+
+        for row in rows:
+            fact_id, content, trust, tags = row
+            fact_tokens = set(re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z0-9_-]+', content.lower()))
+
+            # Extract entity-value pairs from user message and fact
+            user_entities = {}
+            for m in self._ENTITY_VALUE_RE.finditer(user_content):
+                user_entities[m.group(1)] = m.group(2)
+
+            fact_entities = {}
+            for m in self._ENTITY_VALUE_RE.finditer(content):
+                fact_entities[m.group(1)] = m.group(2)
+
+            is_contradiction = False
+            is_agreement = False
+            contradicting_entity = None
+
+            for entity, uval in user_entities.items():
+                if entity in fact_entities:
+                    if fact_entities[entity] != uval:
+                        is_contradiction = True
+                        contradicting_entity = entity
+                    else:
+                        is_agreement = True
+                    break
+
+            if is_agreement:
+                continue
+
+            # Fallback: token overlap without entity-value match
+            if not is_contradiction:
+                overlap = len(user_tokens & fact_tokens)
+                if overlap < 5:
+                    continue
+                is_contradiction = True
+
+            if not is_contradiction:
+                continue
+
+            # ── TIER 1: Auto-resolve when entity-value correction is clear ──
+            if contradicting_entity and contradicting_entity in user_entities:
+                old_val = fact_entities[contradicting_entity]
+                new_val = user_entities[contradicting_entity]
+
+                # Replace old value with corrected value in fact content
+                new_content = _replace_entity_value(
+                    content, contradicting_entity, old_val, new_val
+                )
+
+                new_tags = (tags or "").strip()
+                new_tags = new_tags.replace(",correction:pending", "")\
+                                   .replace("correction:pending", "")\
+                                   .strip(",").strip()
+                if "correction:resolved" not in new_tags:
+                    new_tags = (new_tags + ",correction:resolved").strip(",")
+
+                conn.execute(
+                    "UPDATE facts SET content = ?, tags = ?, trust_score = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE fact_id = ?",
+                    (new_content, new_tags, trust, fact_id),
+                )
+                processed += 1
+                auto_resolved += 1
+                logger.info(
+                    "Correction auto-resolved: fact #%d '%s:%s' → '%s:%s'",
+                    fact_id, contradicting_entity, old_val,
+                    contradicting_entity, new_val,
+                )
+                continue  # Don't apply pre-penalty; already resolved
+
+            # ── TIER 2: Pre-penalty — ambiguous correction, flag for later ──
+            new_trust = max(0.2, trust - 0.05)
+            new_tags = (tags or "").strip()
+            if "correction:pending" not in new_tags:
+                new_tags = (new_tags + ",correction:pending").strip(",")
+
+            conn.execute(
+                "UPDATE facts SET trust_score = ?, tags = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE fact_id = ?",
+                (new_trust, new_tags, fact_id),
+            )
+            processed += 1
+            logger.info(
+                "Correction flagged: fact #%d trust %.2f→%.2f (pending verification)",
+                fact_id, trust, new_trust,
+            )
+
+        if processed:
+            conn.commit()
+
+        return processed
+
+    def resolve_contradiction(self, correct_fact_id: int, wrong_fact_id: int) -> dict:
+        """Resolve a contradiction after agent verification.
+
+        Called by the agent after the user corrects a fact and the agent verifies
+        the correct answer. This is NOT manual fact_feedback — it's triggered
+        automatically by the agent's verification workflow.
+
+        correct_fact_id: the fact that was verified as correct (boost trust).
+        wrong_fact_id: the fact that was wrong (demote or delete).
+
+        Returns dict with resolution details.
+        """
+        if not self._store:
+            return {"status": "error", "reason": "store not available"}
+
+        conn = self._store._conn
+        result = {"status": "ok", "corrected": None, "demoted": None, "deleted": None}
+
+        # Boost the correct fact
+        correct_row = conn.execute(
+            "SELECT fact_id, content, trust_score, tags FROM facts WHERE fact_id = ?",
+            (correct_fact_id,),
+        ).fetchone()
+
+        if correct_row:
+            new_trust = min(1.0, correct_row[2] + 0.05)
+            new_tags = correct_row[3] or ""
+            new_tags = new_tags.replace(",correction:pending", "").replace("correction:pending", "")
+            conn.execute(
+                "UPDATE facts SET trust_score = ?, tags = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE fact_id = ?",
+                (new_trust, new_tags.strip(",").strip(), correct_fact_id),
+            )
+            result["corrected"] = {
+                "fact_id": correct_fact_id,
+                "old_trust": correct_row[2],
+                "new_trust": new_trust,
+                "content": correct_row[1][:80],
+            }
+            logger.info(
+                "Contradiction resolved: correct fact #%d trust %.2f→%.2f",
+                correct_fact_id, correct_row[2], new_trust,
+            )
+
+        # Demote or delete the wrong fact
+        wrong_row = conn.execute(
+            "SELECT fact_id, content, trust_score, tags FROM facts WHERE fact_id = ?",
+            (wrong_fact_id,),
+        ).fetchone()
+
+        if wrong_row:
+            old_trust = wrong_row[2]
+            new_trust = old_trust - 0.15  # Significant penalty for being wrong
+
+            if new_trust < 0.2:
+                # Delete: too low to be useful
+                conn.execute("DELETE FROM facts WHERE fact_id = ?", (wrong_fact_id,))
+                result["deleted"] = {
+                    "fact_id": wrong_fact_id,
+                    "old_trust": old_trust,
+                    "content": wrong_row[1][:80],
+                }
+                logger.info(
+                    "Contradiction resolved: wrong fact #%d deleted (trust %.2f→below floor)",
+                    wrong_fact_id, old_trust,
+                )
+            else:
+                new_tags = (wrong_row[3] or "") + ",correction:demoted"
+                new_tags = new_tags.strip(",").replace("correction:pending,", "").replace(",correction:pending", "")
+                conn.execute(
+                    "UPDATE facts SET trust_score = ?, tags = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE fact_id = ?",
+                    (new_trust, new_tags, wrong_fact_id),
+                )
+                result["demoted"] = {
+                    "fact_id": wrong_fact_id,
+                    "old_trust": old_trust,
+                    "new_trust": new_trust,
+                    "content": wrong_row[1][:80],
+                }
+                logger.info(
+                    "Contradiction resolved: wrong fact #%d trust %.2f→%.2f",
+                    wrong_fact_id, old_trust, new_trust,
+                )
+
+        conn.commit()
+        return result
+
+    def _incremental_extract(self, user_content: str) -> None:
+        """Extract seed facts from a single user message (Chinese + English patterns).
+
+        Called from sync_turn() when auto_extract is enabled. Uses the same
+        patterns as _auto_extract_facts() but operates on individual messages
+        instead of the full session transcript. Extracted facts get default_trust
+        (0.5); the mention-tracking system (change #2) will automatically boost
+        trust_score for facts the user repeatedly references in later turns.
+        """
+        if not self._store or len(user_content) < 15:
+            return
+
+        # Preference patterns (user_pref category)
+        _CN_EN_PREF = [
+            re.compile(r'\bI\s+(?:prefer|like|love|use|want|need)\s+(.+)', re.IGNORECASE),
+            re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
+            re.compile(r'\bI\s+(?:always|never|usually)\s+(.+)', re.IGNORECASE),
+            re.compile(r'(?:我|阿锋).{0,10}(?:喜欢|习惯|一般|通常|总是|从来|基本).{2,30}(?:用|做|选|设|是)'),
+            re.compile(r'(?:我|阿锋).{0,5}(?:偏好|倾向|首选|默认)'),
+            re.compile(r'(?:我的|我们的).{2,20}(?:是|用|设|选|放在)'),
+            re.compile(r'(?:以后|接下来|从现在起).{2,30}(?:都|要|用|按)'),
+            re.compile(r'(?:禁止|不允许|不要|别).{0,10}(?:用|做|设|改)'),
+        ]
+
+        # Decision patterns (project category)
+        _CN_EN_DECISION = [
+            re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
+            re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
+            re.compile(r'(?:我们|方案).{0,10}(?:决定|确定|选择|采用)'),
+            re.compile(r'(?:项目|系统|代码).{0,5}(?:使用|采用|依赖|基于)'),
+            re.compile(r'(?:最终|结论|所以).{0,10}(?:方案|做法|方式)'),
+            re.compile(r'(?:已|已经|前面).{0,5}(?:确认|验证|测试).{0,10}(?:通过|没问题|正常)'),
+        ]
+
+        for pattern in _CN_EN_PREF:
+            if pattern.search(user_content):
+                try:
+                    self._store.add_fact(user_content[:400], category="user_pref")
+                except Exception:
+                    pass
+                return  # One fact per message max
+
+        for pattern in _CN_EN_DECISION:
+            if pattern.search(user_content):
+                try:
+                    self._store.add_fact(user_content[:400], category="project")
+                except Exception:
+                    pass
+                return
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [FACT_STORE_SCHEMA, FACT_FEEDBACK_SCHEMA]
@@ -235,14 +658,122 @@ class HolographicMemoryProvider(MemoryProvider):
         return tool_error(f"Unknown tool: {tool_name}")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        # is_truthy_value: the config schema declares auto_extract as a string
-        # enum ("false"/"true"), and a plain truthiness check treats the string
-        # "false" as enabled (#57682).
+        # Always apply temporal decay: stale facts lose trust over time.
+        self._apply_temporal_decay()
+
+        # Auto-resolve any pending corrections that were flagged but not cleared
+        if self._store:
+            self._auto_resolve_pending_corrections()
+
         if not is_truthy_value(self._config.get("auto_extract", False)):
             return
         if not self._store or not messages:
             return
         self._auto_extract_facts(messages)
+
+    def _auto_resolve_pending_corrections(self) -> int:
+        """Auto-resolve facts still tagged correction:pending.
+
+        For each pending fact, search for another fact sharing the same entity
+        but with a different value — this is the "correct" version. If found,
+        auto-resolve: boost the correct one (+0.05), demote the pending one
+        (-0.15 or delete if trust < 0.2). This cleans up corrections that
+        weren't resolved immediately because the entity-value match was
+        ambiguous at detection time.
+        """
+        if not self._store:
+            return 0
+
+        conn = self._store._conn
+        pending = conn.execute(
+            "SELECT fact_id, content, trust_score, tags FROM facts "
+            "WHERE tags LIKE '%correction:pending%'"
+        ).fetchall()
+
+        if not pending:
+            return 0
+
+        resolved = 0
+        for p_row in pending:
+            p_id, p_content, p_trust, p_tags = p_row
+
+            # Extract entities from this pending fact
+            p_entities = {}
+            for m in self._ENTITY_VALUE_RE.finditer(p_content):
+                p_entities[m.group(1)] = m.group(2)
+
+            if not p_entities:
+                continue
+
+            # Search for a "correct" version: same entity, different value, no pending tag
+            for entity, p_val in p_entities.items():
+                candidates = conn.execute(
+                    "SELECT fact_id, content, trust_score, tags FROM facts "
+                    "WHERE fact_id != ? AND content LIKE ? "
+                    "AND tags NOT LIKE '%correction:pending%' "
+                    "ORDER BY trust_score DESC LIMIT 5",
+                    (p_id, f"%{entity}%"),
+                ).fetchall()
+
+                for c_row in candidates:
+                    c_id, c_content, c_trust, c_tags = c_row
+                    c_entities = {}
+                    for m in self._ENTITY_VALUE_RE.finditer(c_content):
+                        c_entities[m.group(1)] = m.group(2)
+
+                    if entity in c_entities and c_entities[entity] != p_val:
+                        # Found a contradicting pair → auto-resolve
+                        self.resolve_contradiction(c_id, p_id)
+                        resolved += 1
+                        break  # One resolution per pending fact
+
+                if resolved > 0:
+                    break  # Already resolved this pending fact
+
+        if resolved:
+            conn.commit()
+
+        return resolved
+
+    def _apply_temporal_decay(self, days_threshold: int = 60) -> int:
+        """Reduce trust_score for facts not updated in `days_threshold` days.
+
+        Each decay tick: trust_score -= 0.03 (floor: 0.2). Facts below 0.3
+        are never touched — they're already in the "low-confidence" zone.
+        A fact with last_mentioned_at or updated_at within the threshold is
+        spared (the user or system interacted with it recently).
+
+        Returns number of facts decayed.
+        """
+        if not self._store:
+            return 0
+
+        conn = self._store._conn
+        rows = conn.execute(
+            """SELECT fact_id, trust_score FROM facts
+               WHERE trust_score > 0.3
+                 AND (last_mentioned_at IS NULL OR last_mentioned_at < datetime('now', ?))
+                 AND updated_at < datetime('now', ?)""",
+            (f"-{days_threshold} days", f"-{days_threshold} days"),
+        ).fetchall()
+
+        updated = 0
+        for row in rows:
+            fact_id, trust = row
+            new_trust = max(0.2, trust - 0.03)
+            if new_trust < trust:
+                conn.execute(
+                    "UPDATE facts SET trust_score = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE fact_id = ?",
+                    (new_trust, fact_id),
+                )
+                updated += 1
+
+        if updated:
+            conn.commit()
+            logger.info("Decayed %d stale facts (trust -= 0.03)", updated)
+
+        return updated
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes as facts."""
