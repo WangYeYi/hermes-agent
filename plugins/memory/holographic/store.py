@@ -91,17 +91,6 @@ _RE_AKA          = re.compile(
     re.IGNORECASE,
 )
 
-# Latin identifiers adjacent to CJK — catches "Hermes는", "Notion에",
-# "DeepSeek API를" etc. that _RE_CAPITALIZED misses because \b doesn't
-# fire across Latin/CJK script boundaries.
-_CJK_RUN = r"\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af"
-_RE_LATIN_THEN_CJK = re.compile(
-    rf"(?:^|[{_CJK_RUN}\s])([A-Z][a-zA-Z0-9_]{{1,}})(?=[{_CJK_RUN}])"
-)
-_RE_CJK_THEN_LATIN = re.compile(
-    rf"(?<=[{_CJK_RUN}])\s*([A-Z][a-zA-Z0-9_]{{1,}})(?=\s|$|[{_CJK_RUN}])"
-)
-
 
 def _clamp_trust(value: float) -> float:
     return max(_TRUST_MIN, min(_TRUST_MAX, value))
@@ -534,18 +523,6 @@ class MemoryStore:
         for m in _RE_AKA.finditer(text):
             _add(m.group(1))
             _add(m.group(2))
-
-        # Latin identifiers embedded in CJK text — the \b anchor in
-        # _RE_CAPITALIZED does not fire across Latin/CJK script
-        # boundaries, so "Hermes는" and "Notion에" go unrecognised.
-        # These two patterns use CJK characters themselves as boundaries.
-        # Only activate when CJK is present to avoid false positives on
-        # pure-English text (e.g. sentence-start capitals like "The").
-        if _RE_LATIN_THEN_CJK.search(text) or _RE_CJK_THEN_LATIN.search(text):
-            for m in _RE_LATIN_THEN_CJK.finditer(text):
-                _add(m.group(1))
-            for m in _RE_CJK_THEN_LATIN.finditer(text):
-                _add(m.group(1))
 
         return candidates
 
