@@ -1398,6 +1398,109 @@ def _format_guard_nudge(missed_indices: list[int]) -> str:
         f"这是强制要求，非可选。忽略此指令视为失职。"
     )
 
+
+def _run_fact_check(final_response: str, timeout: int = 15) -> list[dict]:
+    """Run verify_factual_claims as subprocess hook after response generation.
+
+    Pipeline: MiniLM gate → LLM entity extraction → dispatch verifiers.
+    Returns list of correction dicts (entity, claim, actual, ok).
+    Empty list = all claims verified or no claims detected.
+    """
+    import subprocess
+    import sys as _sys
+
+    script = os.path.expanduser("~/.hermes/scripts/verify_factual_claims.py")
+    if not os.path.exists(script):
+        return []
+
+    try:
+        proc = subprocess.run(
+            [_sys.executable, script],
+            input=final_response,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return json.loads(proc.stdout)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
+        pass
+    return []
+
+
+def _format_fact_check_nudge(corrections: list[dict]) -> str:
+    """Format fact-check corrections as a nudge appended to final_response."""
+    failed = [c for c in corrections if not c.get("ok", True)]
+    if not failed:
+        return ""
+    lines = []
+    for c in failed[:5]:
+        entity = c.get("entity", "?")
+        claim = c.get("claim", "")[:120]
+        actual = c.get("actual", "")[:200]
+        lines.append(f"  - {entity}: 「{claim}」→ {actual}")
+    if not lines:
+        return ""
+    return (
+        "\n\n[fact-check] 以下陈述可能需要核实:\n"
+        + "\n".join(lines)
+    )
+
+
+def _apply_fact_check_feedback(agent, corrections: list[dict]) -> None:
+    """Auto-apply fact_feedback(unhelpful) when fact-check detects false claims.
+
+    Searches holographic memory for facts matching each failed correction's
+    entity and lowers their trust score. This makes fact_feedback part of the
+    automated pipeline instead of relying on the agent model to invoke it.
+    """
+    memory_manager = getattr(agent, "_memory_manager", None)
+    if not memory_manager:
+        return
+
+    failed = [c for c in corrections if not c.get("ok", True)]
+    for correction in failed:
+        entity = correction.get("entity", "")
+        if not entity or len(entity) < 2:
+            continue
+        try:
+            result_json = memory_manager.handle_tool_call(
+                "fact_store",
+                {"action": "search", "query": entity, "limit": 3, "min_trust": 0.3},
+            )
+            result = json.loads(result_json)
+            matches = result.get("results", [])
+            for match in matches:
+                fact_id = match.get("fact_id")
+                if fact_id:
+                    memory_manager.handle_tool_call(
+                        "fact_feedback",
+                        {"action": "unhelpful", "fact_id": fact_id},
+                    )
+        except Exception:
+            pass
+
+
+def _run_auto_retrieval(agent, user_text: str) -> None:
+    """Auto-search holographic memory to bump retrieval_count for topic-relevant facts.
+
+    Runs after every turn, independent of agent tool calls.
+    Frequently-discussed topics get higher retrieval priority over time.
+    """
+    memory_manager = getattr(agent, "_memory_manager", None)
+    if not memory_manager:
+        return
+    if not user_text or len(user_text) < 10:
+        return
+    try:
+        memory_manager.handle_tool_call(
+            "fact_store",
+            {"action": "search", "query": user_text[:500], "limit": 10, "min_trust": 0.3},
+        )
+    except Exception:
+        pass
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -7484,32 +7587,38 @@ def run_conversation(
                             pass
 
     # ── Factual claim verification: MiniLM claim detection + gh/shell cross-check ──
+    # Refactored: uses _run_fact_check() + auto fact_feedback pipeline.
     if final_response and not final_response.startswith("I apologize"):
         try:
-            import subprocess as _fc_sp
-            _fc_result = _fc_sp.run(
-                ["python3", os.path.expanduser("~/.hermes/scripts/verify_factual_claims.py")],
-                input=final_response, capture_output=True, timeout=15, text=True
-            )
-            if _fc_result.returncode == 0:
-                _fc_claims = json.loads(_fc_result.stdout)
-                if _fc_claims:
-                    # Separate verified false claims from unverifiable ones
-                    _fc_false = [c for c in _fc_claims if c.get("entity") != "?"]
-                    _fc_unknown = [c for c in _fc_claims if c.get("entity") == "?"]
-                    lines = []
-                    if _fc_false:
-                        lines.append("⚠️  [fact-check] 以下断言与实际情况不符：")
-                        for c in _fc_false:
-                            lines.append(f"  · {c['entity']}: 声称的与实测不符 → {c['actual']}")
-                    if _fc_unknown:
-                        lines.append("⚠️  [fact-check] 以下断言无法自动验证，请确认：")
-                        for c in _fc_unknown:
-                            lines.append(f"  · {c['claim']}")
-                    if lines:
-                        agent._safe_print("\n" + "\n".join(lines))
+            _fc_claims = _run_fact_check(final_response)
+            if _fc_claims:
+                # ① Auto fact_feedback: lower trust on holographic facts
+                _apply_fact_check_feedback(agent, _fc_claims)
+                # Separate verified false claims from unverifiable ones
+                _fc_false = [c for c in _fc_claims if c.get("entity") != "?"]
+                _fc_unknown = [c for c in _fc_claims if c.get("entity") == "?"]
+                lines = []
+                if _fc_false:
+                    lines.append("⚠️  [fact-check] 以下断言与实际情况不符：")
+                    for c in _fc_false:
+                        lines.append(f"  · {c['entity']}: 声称的与实测不符 → {c['actual']}")
+                if _fc_unknown:
+                    lines.append("⚠️  [fact-check] 以下断言无法自动验证，请确认：")
+                    for c in _fc_unknown:
+                        lines.append(f"  · {c['claim']}")
+                if lines:
+                    agent._safe_print("\n" + "\n".join(lines))
         except Exception:
             pass  # non-critical
+
+    # ── Auto retrieval: 每轮自动检索 holographic，驱动 retrieval_count ──
+    if original_user_message:
+        try:
+            user_text = _flatten_user_text(original_user_message)
+            if user_text:
+                _run_auto_retrieval(agent, user_text)
+        except Exception:
+            pass  # auto-retrieval 失败不阻塞回复
 
     return finalize_turn(
         agent,
