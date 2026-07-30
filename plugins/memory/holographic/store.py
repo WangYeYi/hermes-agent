@@ -222,6 +222,12 @@ class MemoryStore:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
         if "onnx_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN onnx_vector BLOB")
+        # Migrate: mention_count + last_mentioned_at for automatic trust
+        # weighting based on real conversation references (not just retrieval).
+        if "mention_count" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN mention_count INTEGER DEFAULT 0")
+        if "last_mentioned_at" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN last_mentioned_at TIMESTAMP")
         self._conn.commit()
 
         # Lazy-load ONNX embedder (Chinese-optimized, zero PyTorch)
@@ -462,7 +468,9 @@ class MemoryStore:
 
             sql = f"""
                 SELECT fact_id, content, category, tags, trust_score,
-                       retrieval_count, helpful_count, created_at, updated_at
+                       retrieval_count, helpful_count,
+                       mention_count, last_mentioned_at,
+                       created_at, updated_at
                 FROM facts
                 WHERE trust_score >= ?
                   {category_clause}

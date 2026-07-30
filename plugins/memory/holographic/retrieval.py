@@ -110,9 +110,6 @@ class FactRetriever:
         # Stage 1: Get FTS5 candidates (more than limit for reranking headroom)
         candidates = self._fts_candidates(query, category, min_trust, limit * 3)
 
-        if not candidates:
-            return []
-
         # Stage 2: Rerank with Jaccard + ONNX + HRR + trust + optional decay
         query_tokens = self._tokenize(query)
         scored = []
@@ -124,6 +121,32 @@ class FactRetriever:
                 query_onnx_vec = self._onnx.embed(query)
             except Exception:
                 pass
+
+        # ─── FTS5 fallback: ONNX semantic retrieval ───
+        # FTS5 uses Unicode tokenizer → no CJK word segmentation → Chinese
+        # queries routinely return zero candidates. When FTS5 produces nothing,
+        # ONNX (bge-small-zh-v1.5) takes over as the PRIMARY retrieval path
+        # instead of being relegated to a 0.15 weighting pass that never fires.
+        onnx_fallback = False
+        if not candidates:
+            if query_onnx_vec is not None:
+                candidates = self._onnx_candidates(query_onnx_vec, category, min_trust, limit * 3)
+                onnx_fallback = True
+            if not candidates:
+                # Last resort: brute-force Jaccard scan against all facts
+                candidates = self._brute_force_candidates(query_tokens, category, min_trust, limit * 3)
+
+        if not candidates:
+            return []
+
+        # When ONNX is the primary path (FTS5 empty), skip the mixed scoring.
+        # Jaccard and HRR add zero signal for Chinese queries (no token overlap,
+        # HRR vectors unreliable), and the FTS5 weight is irrelevant. ONNX
+        # candidates are already ranked by cosine similarity with mild trust boost.
+        if onnx_fallback:
+            for fact in candidates:
+                fact.pop("hrr_vector", None)
+            return candidates[:limit]
 
         for fact in candidates:
             content_tokens = self._tokenize(fact["content"])
@@ -178,6 +201,24 @@ class FactRetriever:
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
+
+        # Bug fix: retrieval_count was never incremented from this path because
+        # _fts_candidates() queries the DB directly, bypassing the only increment
+        # logic in store.search_facts(). Without this, the agent's claim that
+        # "facts retrieved more often get higher trust" was never true.
+        if results:
+            ids = [r["fact_id"] for r in results]
+            placeholders = ",".join("?" * len(ids))
+            try:
+                self.store._conn.execute(
+                    f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
+                    f"WHERE fact_id IN ({placeholders})",
+                    ids,
+                )
+                self.store._conn.commit()
+            except Exception:
+                pass
+
         return results
 
     def probe(
@@ -631,6 +672,112 @@ class FactRetriever:
             results.append(fact)
 
         return results
+
+    def _onnx_candidates(
+        self,
+        query_onnx_vec: "np.ndarray",
+        category: str | None,
+        min_trust: float,
+        limit: int,
+    ) -> list[dict]:
+        """ONNX semantic retrieval — primary fallback when FTS5 returns empty.
+
+        Cosine-similarity ranks ALL facts with onnx_vector, returns top-N.
+        This is the path that makes Chinese queries actually work — bge-small-zh-v1.5
+        understands semantic similarity without needing CJK tokenization.
+        """
+        import numpy as np
+
+        conn = self.store._conn
+        where = "WHERE onnx_vector IS NOT NULL"
+        params: list = []
+        if category:
+            where += " AND category = ?"
+            params.append(category)
+        if min_trust > 0:
+            where += " AND trust_score >= ?"
+            params.append(min_trust)
+
+        rows = conn.execute(
+            f"SELECT fact_id, content, category, tags, trust_score, "
+            f"retrieval_count, helpful_count, created_at, updated_at, onnx_vector "
+            f"FROM facts {where}",
+            params,
+        ).fetchall()
+
+        if not rows:
+            return []
+
+        # Cosine similarity between query embedding and each fact's onnx_vector
+        scored = []
+        query_norm = np.linalg.norm(query_onnx_vec)
+        for row in rows:
+            fact = dict(row)
+            raw_vec = fact.get("onnx_vector")
+            if raw_vec is None:
+                continue
+            try:
+                fact_onnx = np.frombuffer(raw_vec, dtype=np.float32)
+                fact_norm = np.linalg.norm(fact_onnx)
+                if query_norm > 0 and fact_norm > 0:
+                    sim = float(np.dot(query_onnx_vec, fact_onnx) / (query_norm * fact_norm))
+                else:
+                    sim = 0.0
+            except Exception:
+                sim = 0.0
+            # Rank by semantic similarity; trust is a secondary boost (not a multiplier).
+            # "sim * trust" lets trust=0.7 facts with sim=0.28 outrank trust=0.5 facts
+            # with sim=0.51 — trust should not override semantic relevance.
+            shifted = (sim + 1.0) / 2.0  # cosine [-1,1] → [0,1]
+            score = shifted * (0.4 + 0.6 * fact["trust_score"])  # trust: mild 60% modifier
+            fact["score"] = score
+            fact["fts_rank"] = shifted  # for downstream mixed-scoring compatibility
+            scored.append(fact)
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[:limit]
+
+    def _brute_force_candidates(
+        self,
+        query_tokens: set[str],
+        category: str | None,
+        min_trust: float,
+        limit: int,
+    ) -> list[dict]:
+        """Last-resort Jaccard scan over all facts when both FTS5 and ONNX fail."""
+        conn = self.store._conn
+        where = "WHERE 1=1"
+        params: list = []
+        if category:
+            where += " AND category = ?"
+            params.append(category)
+        if min_trust > 0:
+            where += " AND trust_score >= ?"
+            params.append(min_trust)
+
+        rows = conn.execute(
+            f"SELECT fact_id, content, category, tags, trust_score, "
+            f"retrieval_count, helpful_count, created_at, updated_at "
+            f"FROM facts {where}",
+            params,
+        ).fetchall()
+
+        if not rows:
+            return []
+
+        scored = []
+        for row in rows:
+            fact = dict(row)
+            content_tokens = self._tokenize(fact["content"])
+            tag_tokens = self._tokenize(fact.get("tags", ""))
+            all_tokens = content_tokens | tag_tokens
+            jaccard = self._jaccard_similarity(query_tokens, all_tokens)
+            fact["score"] = jaccard * fact["trust_score"]
+            fact["fts_rank"] = jaccard
+            scored.append(fact)
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[:limit]
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:

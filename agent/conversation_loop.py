@@ -1112,9 +1112,20 @@ def _split_user_items(text: str) -> list[str]:
     segments = re.split(r'(?<=[。！？])\s*|\n+', text)
     segments = [s.strip().rstrip('。！？，,') for s in segments if len(s.strip().rstrip('。！？，,')) >= 3]
     if len(segments) < 2:
+        # Try transition words first
         sub = re.split(r'(?:还有|另外|以及|另外问|顺便|同时|此外|再加上|最后|然后)', text)
         sub = [s.strip().rstrip('，,') for s in sub if len(s.strip()) > 3]
-        return sub if len(sub) >= 2 else [text.strip()]
+        if len(sub) >= 2:
+            return sub
+        # Try comma-separated compound questions: "A，B，C？"
+        if "，" in text and re.search(r'[？?吗呢]|怎么|如何|是不是|能不能', text):
+            comma_parts = re.split(r'[，,]', text)
+            question_pattern = r'[？?吗呢]|怎么|如何|是不是|能不能|要不要|会不会|有没有|是否|怎样|几个|多少'
+            if sum(1 for p in comma_parts if re.search(question_pattern, p)) >= 1:
+                parts = [p.strip() for p in comma_parts if len(p.strip()) >= 3]
+                if len(parts) >= 2:
+                    return parts
+        return [text.strip()]
 
     result = []
     for seg in segments:
@@ -1122,6 +1133,24 @@ def _split_user_items(text: str) -> list[str]:
         for s in sub:
             s = s.strip()
             if len(s) >= 3:
+                # Split comma-separated compound questions.
+                # Pattern: "A，B，C？" where the last segment has a
+                # question marker or any segment uses interrogative
+                # words (怎么/如何/是不是/能不能/有没有/会不会).
+                if "，" in s or "？" in s:
+                    comma_parts = re.split(r'[，,]', s)
+                    # Only split if at least one part looks like a question
+                    question_pattern = r'[？?吗呢]|怎么|如何|是不是|能不能|要不要|会不会|有没有|是否|怎样|几个|多少'
+                    question_count = sum(
+                        1 for p in comma_parts
+                        if re.search(question_pattern, p)
+                    )
+                    if question_count >= 2 or (question_count >= 1 and s.rstrip().endswith("？")):
+                        for p in comma_parts:
+                            p = p.strip()
+                            if len(p) >= 3:
+                                result.append(p)
+                        continue
                 result.append(s)
     return result if len(result) >= 2 else [text.strip()]
 
@@ -1137,14 +1166,14 @@ def _guard_write_log(entry: dict) -> None:
     try:
         os.makedirs(os.path.dirname(_GUARD_LOG_PATH), exist_ok=True)
         now = time.time()
-        with open(_GUARD_LOG_PATH, "a") as f:
+        with open(_GUARD_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         # 低频清理：每小时最多一次
         if os.path.getmtime(_GUARD_LOG_PATH) < now - 3600:
             cutoff = now - _GUARD_LOG_MAX_AGE
             try:
                 tmp = _GUARD_LOG_PATH + ".tmp"
-                with open(_GUARD_LOG_PATH) as fin, open(tmp, "w") as fout:
+                with open(_GUARD_LOG_PATH, encoding="utf-8") as fin, open(tmp, "w", encoding="utf-8") as fout:
                     for line in fin:
                         try:
                             e = json.loads(line)
@@ -1211,6 +1240,25 @@ def _run_output_guard(agent, final_response: str, original_user_message: Any) ->
     user_text = _flatten_user_text(original_user_message)
     if not user_text:
         return []
+
+    # Skip system-prompt fragments — skill curator instructions, memory
+    # review prompts, and other injected scaffolding are not real user
+    # questions and would produce massive false-positive missed-item lists
+    # (e.g. 34-item curator instructions checked against every answer).
+    _SYSTEM_PROMPT_PATTERNS = [
+        "Review the conversation above and update the skill",
+        "Target shape of the library",
+        "Signals to look for",
+        "Preference order",
+        "Protected skills",
+        "Do NOT capture",
+        "Based on the conversation above",
+        "Consider the following",
+        "Focus on:",
+    ]
+    if any(user_text.startswith(p) for p in _SYSTEM_PROMPT_PATTERNS):
+        return []
+
     items = _split_user_items(user_text)
     if len(items) < 2:
         return []
@@ -1308,7 +1356,17 @@ def _run_output_guard(agent, final_response: str, original_user_message: Any) ->
             for r in l2_results
             if not r.get("covered")
         ]
-        uncertain_for_l3 = list(dict.fromkeys(l2_missed + missed))  # 合并去重
+        # L2 判 covered 但 sim 低于不确定阈值的条目也送 L3
+        # （MiniLM 68% 准确率不可靠，低 sim 的"covered"可能是误判）
+        UNCERTAIN_SIM = 0.25
+        l2_uncertain = [
+            remaining[r["index"] - 1]
+            for r in l2_results
+            if r.get("covered") and r.get("similarity", 0) < UNCERTAIN_SIM
+        ]
+        log_entry["l2"]["uncertain_threshold"] = UNCERTAIN_SIM
+        log_entry["l2"]["uncertain_indices"] = l2_uncertain
+        uncertain_for_l3 = list(dict.fromkeys(l2_missed + l2_uncertain + missed))  # 合并去重
 
     if not uncertain_for_l3:
         _guard_write_log(log_entry)
@@ -1324,12 +1382,21 @@ def _run_output_guard(agent, final_response: str, original_user_message: Any) ->
     _guard_write_log(log_entry)
     return final_missed
 
+# 跨轮 nudge 去重：同一组遗漏不反复注入（思考里补充了但正文没体现 → 死循环）
+_LAST_GUARD_NUDGES: set[str] = set()
+
+
 def _format_guard_nudge(missed_indices: list[int]) -> str:
-    """格式化遗漏提醒"""
+    """格式化遗漏提醒 — 作为系统级指令注入，非引用块"""
     if not missed_indices:
         return ""
     items_str = "、".join(f"第{i}条" for i in missed_indices)
-    return f"\n\n> ⚠️ [输出覆盖检查] 检测到上述回答遗漏了 {items_str}，请补充。" if missed_indices else ""
+    return (
+        f"\n\n[SYSTEM INSTRUCTION — 输出覆盖检查] "
+        f"上述回答遗漏了用户问题的 {items_str}。"
+        f"你必须在下一轮回复中补充回答这些被遗漏的问题。"
+        f"这是强制要求，非可选。忽略此指令视为失职。"
+    )
 
 def run_conversation(
     agent,
@@ -7378,6 +7445,72 @@ def run_conversation(
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
+
+    # ── Output guard: check coverage after turn completes ──
+    _guard_missing: list[int] = []
+    if (
+        final_response
+        and not final_response.startswith("I apologize")
+        and original_user_message is not None
+    ):
+        _guard_missing = _run_output_guard(
+            agent, final_response, original_user_message
+        )
+        if _guard_missing:
+            items_str = "、".join(f"第{i}条" for i in _guard_missing)
+            agent._safe_print(
+                f"\n⚠️  [output-guard] 检测到遗漏 {items_str}，已追加提醒"
+            )
+            # Inject nudge as a hidden system message into conversation
+            # history so the model sees it next turn, but do NOT append
+            # it to the user-visible final_response (avoid ugly SYSTEM
+            # INSTRUCTION text leaking into the terminal output).
+            nudge = _format_guard_nudge(_guard_missing)
+            if nudge:
+                import hashlib as _hl
+                _nudge_key = _hl.md5(nudge.encode()).hexdigest()
+                if _nudge_key not in _LAST_GUARD_NUDGES:
+                    _LAST_GUARD_NUDGES.add(_nudge_key)
+                    if nudge not in final_response:
+                        # Inject into conversation_history + messages as a
+                        # hidden user message so the model processes it next
+                        # turn, without the user seeing ugly SYSTEM
+                        # INSTRUCTION text in the terminal.
+                        nudge_msg = {"role": "user", "content": nudge.strip()}
+                        conversation_history.append(nudge_msg)
+                        try:
+                            messages.append(nudge_msg)
+                        except (TypeError, AttributeError):
+                            pass
+
+    # ── Factual claim verification: MiniLM claim detection + gh/shell cross-check ──
+    if final_response and not final_response.startswith("I apologize"):
+        try:
+            import subprocess as _fc_sp
+            _fc_result = _fc_sp.run(
+                ["python3", os.path.expanduser("~/.hermes/scripts/verify_factual_claims.py")],
+                input=final_response, capture_output=True, timeout=15, text=True
+            )
+            if _fc_result.returncode == 0:
+                _fc_claims = json.loads(_fc_result.stdout)
+                if _fc_claims:
+                    # Separate verified false claims from unverifiable ones
+                    _fc_false = [c for c in _fc_claims if c.get("entity") != "?"]
+                    _fc_unknown = [c for c in _fc_claims if c.get("entity") == "?"]
+                    lines = []
+                    if _fc_false:
+                        lines.append("⚠️  [fact-check] 以下断言与实际情况不符：")
+                        for c in _fc_false:
+                            lines.append(f"  · {c['entity']}: 声称的与实测不符 → {c['actual']}")
+                    if _fc_unknown:
+                        lines.append("⚠️  [fact-check] 以下断言无法自动验证，请确认：")
+                        for c in _fc_unknown:
+                            lines.append(f"  · {c['claim']}")
+                    if lines:
+                        agent._safe_print("\n" + "\n".join(lines))
+        except Exception:
+            pass  # non-critical
+
     return finalize_turn(
         agent,
         final_response=final_response,
