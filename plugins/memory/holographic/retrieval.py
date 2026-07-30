@@ -36,6 +36,7 @@ class FactRetriever:
         jaccard_weight: float = 0.25,
         hrr_weight: float = 0.25,
         onnx_weight: float = 0.15,
+        retrieval_weight: float = 0.10,  # boost for frequently-retrieved facts
         hrr_dim: int = 1024,
     ):
         self.store = store
@@ -66,10 +67,60 @@ class FactRetriever:
         self.jaccard_weight = jaccard_weight
         self.hrr_weight = hrr_weight
         self.onnx_weight = onnx_weight
+        self.retrieval_weight = retrieval_weight
 
         # Track dimension mismatches for migration guidance.
         self._mismatch_count: int = 0
         self._mismatch_warned: bool = False
+
+    def _increment_retrieval_count(self, results: list[dict]) -> None:
+        """Increment retrieval_count for facts returned by any retrieval path.
+
+        Called by search/probe/reason/related/contradict before returning results.
+        This tracks how often a fact was actually USED, so frequently-accessed
+        facts earn higher retrieval priority over time.
+        """
+        if not results:
+            return
+        try:
+            ids = [r["fact_id"] for r in results if r.get("fact_id")]
+            if not ids:
+                return
+            placeholders = ",".join("?" * len(ids))
+            self.store._conn.execute(
+                f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
+                f"WHERE fact_id IN ({placeholders})",
+                ids,
+            )
+            self.store._conn.commit()
+        except Exception:
+            pass
+
+    def _apply_retrieval_boost(self, fact: dict) -> None:
+        """Apply retrieval_count boost to a fact's score in-place.
+
+        Boost = retrieval_weight * min(retrieval_count / 50, 1.0)
+        A fact retrieved 50+ times gets the full retrieval_weight multiplier.
+        """
+        if self.retrieval_weight <= 0:
+            return
+        rc = fact.get("retrieval_count", 0) or 0
+        if rc <= 0:
+            return
+        boost = 1.0 + self.retrieval_weight * min(rc / 50.0, 1.0)
+        fact["score"] = fact.get("score", 1.0) * boost
+
+    def _finalize_results(self, scored: list[dict], limit: int) -> list[dict]:
+        """Post-process: sort, slice, increment retrieval_count, apply boost.
+
+        Called by probe/related/reason/contradict before returning results.
+        """
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        results = scored[:limit]
+        self._increment_retrieval_count(results)
+        for fact in results:
+            self._apply_retrieval_boost(fact)
+        return results
 
     def _skip_dim_mismatch(self):
         """Increment the mismatch counter and log a one-time warning.
@@ -146,7 +197,11 @@ class FactRetriever:
         if onnx_fallback:
             for fact in candidates:
                 fact.pop("hrr_vector", None)
-            return candidates[:limit]
+            results = candidates[:limit]
+            self._increment_retrieval_count(results)
+            for fact in results:
+                self._apply_retrieval_boost(fact)
+            return results
 
         for fact in candidates:
             content_tokens = self._tokenize(fact["content"])
@@ -202,22 +257,10 @@ class FactRetriever:
         for fact in results:
             fact.pop("hrr_vector", None)
 
-        # Bug fix: retrieval_count was never incremented from this path because
-        # _fts_candidates() queries the DB directly, bypassing the only increment
-        # logic in store.search_facts(). Without this, the agent's claim that
-        # "facts retrieved more often get higher trust" was never true.
-        if results:
-            ids = [r["fact_id"] for r in results]
-            placeholders = ",".join("?" * len(ids))
-            try:
-                self.store._conn.execute(
-                    f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
-                    f"WHERE fact_id IN ({placeholders})",
-                    ids,
-                )
-                self.store._conn.commit()
-            except Exception:
-                pass
+        self._increment_retrieval_count(results)
+        # Apply retrieval_count boost (frequently-used facts rank higher)
+        for fact in results:
+            self._apply_retrieval_boost(fact)
 
         return results
 
@@ -303,7 +346,7 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        return self._finalize_results(scored, limit)
 
     def related(
         self,
@@ -374,7 +417,7 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        return self._finalize_results(scored, limit)
 
     def reason(
         self,
@@ -455,7 +498,7 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        return self._finalize_results(scored, limit)
 
     def contradict(
         self,
@@ -564,7 +607,25 @@ class FactRetriever:
                     })
 
         contradictions.sort(key=lambda x: x["contradiction_score"], reverse=True)
-        return contradictions[:limit]
+        results = contradictions[:limit]
+        # Increment retrieval_count for both facts in each contradictory pair
+        for pair in results:
+            for key in ("fact_a", "fact_b"):
+                fid = pair.get(key, {}).get("fact_id")
+                if fid:
+                    try:
+                        self.store._conn.execute(
+                            "UPDATE facts SET retrieval_count = retrieval_count + 1 WHERE fact_id = ?",
+                            (fid,),
+                        )
+                    except Exception:
+                        pass
+        if results:
+            try:
+                self.store._conn.commit()
+            except Exception:
+                pass
+        return results
 
     def _score_facts_by_vector(
         self,
