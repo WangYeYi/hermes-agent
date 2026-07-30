@@ -49,6 +49,7 @@ FACT_STORE_SCHEMA = {
         "• related — What connects to an entity? Structural adjacency.\n"
         "• reason — Compositional: facts connected to MULTIPLE entities simultaneously.\n"
         "• contradict — Memory hygiene: find facts making conflicting claims.\n"
+        "• resolve — Agent-called: correct fact boosted, wrong fact demoted/deleted.\n"
         "• update/remove/list — CRUD operations.\n\n"
         "IMPORTANT: Before answering questions about the user, ALWAYS probe or reason first."
     ),
@@ -57,7 +58,7 @@ FACT_STORE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "search", "probe", "related", "reason", "contradict", "update", "remove", "list"],
+                "enum": ["add", "search", "probe", "related", "reason", "contradict", "resolve", "update", "remove", "list"],
             },
             "content": {"type": "string", "description": "Fact content (required for 'add')."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
@@ -214,12 +215,48 @@ class HolographicMemoryProvider(MemoryProvider):
                 "Use fact_store(action='add') to store durable structured facts about people, projects, preferences, decisions.\n"
                 "Use fact_feedback to rate facts after using them (trains trust scores)."
             )
-        return (
+
+        # Inject high-value facts directly into the system prompt so the agent
+        # never has to "remember to retrieve" — the most important facts are
+        # always visible. Two cohorts are merged (deduplicated by fact_id):
+        #   1. High-trust facts (trust_score >= 0.6) — user-confirmed knowledge
+        #   2. Recently added facts — current-session relevant context
+        # Max 6 facts total to keep prompt footprint small.
+        try:
+            facts = self._store._conn.execute(
+                "SELECT fact_id, content, trust_score, category FROM facts "
+                "WHERE trust_score >= 0.6 AND (deleted IS NULL OR deleted = 0) "
+                "ORDER BY updated_at DESC LIMIT 3"
+            ).fetchall()
+        except Exception:
+            facts = []
+        seen_ids = {f[0] for f in facts}
+        try:
+            recent = self._store._conn.execute(
+                "SELECT fact_id, content, trust_score, category FROM facts "
+                "WHERE fact_id NOT IN ({}) AND (deleted IS NULL OR deleted = 0) "
+                "ORDER BY created_at DESC LIMIT 3".format(
+                    ",".join(str(rid) for rid in seen_ids) if seen_ids else "0"
+                )
+            ).fetchall()
+        except Exception:
+            recent = []
+        facts = facts + recent
+
+        header = (
             f"# Holographic Memory\n"
             f"Active. {total} facts stored with entity resolution and trust scoring.\n"
             f"Use fact_store to search, probe entities, reason across entities, or add facts.\n"
-            f"Use fact_feedback to rate facts after using them (trains trust scores)."
+            f"Use fact_feedback to rate facts after using them (trains trust scores).\n"
         )
+        if not facts:
+            return header
+
+        lines = [header, "Injected facts (auto-loaded every turn; no retrieval needed):"]
+        for fact in facts:
+            tag = "[HIGH]" if fact[2] and fact[2] >= 0.6 else "[RECENT]"
+            lines.append(f"- {tag} [{fact[3]}] {fact[1]}")
+        return "\n".join(lines)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not self._retriever or not query:
@@ -374,17 +411,15 @@ class HolographicMemoryProvider(MemoryProvider):
     )
 
     def _detect_corrections(self, user_content: str) -> int:
-        """Detect user corrections and auto-resolve when the new value is clear.
+        """Detect when the user corrects a stored fact and apply pre-penalty.
 
-        Two-tier resolution:
-        1. AUTO-RESOLVE: if the user provides a clear entity-value correction
-           (e.g. "端口是7897，之前7890错了"), update the fact content with the
-           new value immediately. No agent involvement needed.
-        2. PRE-PENALTY: if a correction signal is detected but the corrected
-           value is ambiguous (token overlap fallback), flag with pre-penalty
-           trust -= 0.05 for later resolution.
+        When a correction signal is detected in the user message and matches a
+        stored fact, that fact's trust is reduced by 0.05 immediately (pre-penalty).
+        The agent is expected to verify the correction and call
+        resolve_contradiction() to finalize: correct fact gets boosted, wrong
+        fact gets demoted or deleted.
 
-        Returns number of facts processed (flagged or auto-resolved).
+        Returns number of facts flagged for correction.
         """
         if not self._store or len(user_content) < 8:
             return 0
@@ -396,6 +431,7 @@ class HolographicMemoryProvider(MemoryProvider):
             m = pat.search(user_content)
             if m:
                 correction_signal = True
+                # Try to extract the corrected value
                 groups = m.groups()
                 if groups and groups[0]:
                     corrected_value = groups[0].strip()
@@ -406,6 +442,7 @@ class HolographicMemoryProvider(MemoryProvider):
         if not correction_signal:
             return 0
 
+        # Second: find which stored facts are being contradicted
         conn = self._store._conn
         rows = conn.execute(
             "SELECT fact_id, content, trust_score, tags FROM facts "
@@ -413,8 +450,7 @@ class HolographicMemoryProvider(MemoryProvider):
             "ORDER BY trust_score DESC LIMIT 100"
         ).fetchall()
 
-        processed = 0
-        auto_resolved = 0
+        flagged = 0
         user_tokens = set(re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z0-9_-]+', user_content.lower()))
 
         for row in rows:
@@ -430,23 +466,23 @@ class HolographicMemoryProvider(MemoryProvider):
             for m in self._ENTITY_VALUE_RE.finditer(content):
                 fact_entities[m.group(1)] = m.group(2)
 
+            # Determine relation: contradiction, agreement, or no match
             is_contradiction = False
             is_agreement = False
-            contradicting_entity = None
 
             for entity, uval in user_entities.items():
                 if entity in fact_entities:
                     if fact_entities[entity] != uval:
-                        is_contradiction = True
-                        contradicting_entity = entity
+                        is_contradiction = True  # Same entity, DIFFERENT value → wrong!
                     else:
-                        is_agreement = True
+                        is_agreement = True       # Same entity, SAME value → correct!
                     break
 
+            # If entity-value match shows AGREEMENT, this fact is correct — don't flag
             if is_agreement:
                 continue
 
-            # Fallback: token overlap without entity-value match
+            # Fallback: if no entity-value match but high token overlap + correction signal
             if not is_contradiction:
                 overlap = len(user_tokens & fact_tokens)
                 if overlap < 5:
@@ -456,58 +492,30 @@ class HolographicMemoryProvider(MemoryProvider):
             if not is_contradiction:
                 continue
 
-            # ── TIER 1: Auto-resolve when entity-value correction is clear ──
-            if contradicting_entity and contradicting_entity in user_entities:
-                old_val = fact_entities[contradicting_entity]
-                new_val = user_entities[contradicting_entity]
-
-                # Replace old value with corrected value in fact content
-                new_content = _replace_entity_value(
-                    content, contradicting_entity, old_val, new_val
-                )
-
-                new_tags = (tags or "").strip()
-                new_tags = new_tags.replace(",correction:pending", "")\
-                                   .replace("correction:pending", "")\
-                                   .strip(",").strip()
-                if "correction:resolved" not in new_tags:
-                    new_tags = (new_tags + ",correction:resolved").strip(",")
-
-                conn.execute(
-                    "UPDATE facts SET content = ?, tags = ?, trust_score = ?, "
-                    "updated_at = CURRENT_TIMESTAMP WHERE fact_id = ?",
-                    (new_content, new_tags, trust, fact_id),
-                )
-                processed += 1
-                auto_resolved += 1
-                logger.info(
-                    "Correction auto-resolved: fact #%d '%s:%s' → '%s:%s'",
-                    fact_id, contradicting_entity, old_val,
-                    contradicting_entity, new_val,
-                )
-                continue  # Don't apply pre-penalty; already resolved
-
-            # ── TIER 2: Pre-penalty — ambiguous correction, flag for later ──
+            # Apply pre-penalty: reduce trust while waiting for verification
             new_trust = max(0.2, trust - 0.05)
             new_tags = (tags or "").strip()
             if "correction:pending" not in new_tags:
                 new_tags = (new_tags + ",correction:pending").strip(",")
 
             conn.execute(
-                "UPDATE facts SET trust_score = ?, tags = ?, "
-                "updated_at = CURRENT_TIMESTAMP WHERE fact_id = ?",
+                """UPDATE facts SET
+                   trust_score = ?,
+                   tags = ?,
+                   updated_at = CURRENT_TIMESTAMP
+                WHERE fact_id = ?""",
                 (new_trust, new_tags, fact_id),
             )
-            processed += 1
+            flagged += 1
             logger.info(
-                "Correction flagged: fact #%d trust %.2f→%.2f (pending verification)",
-                fact_id, trust, new_trust,
+                "Correction detected: fact #%d trust %.2f→%.2f "
+                "(awaiting agent verification)", fact_id, trust, new_trust
             )
 
-        if processed:
+        if flagged:
             conn.commit()
 
-        return processed
+        return flagged
 
     def resolve_contradiction(self, correct_fact_id: int, wrong_fact_id: int) -> dict:
         """Resolve a contradiction after agent verification.
@@ -659,81 +667,17 @@ class HolographicMemoryProvider(MemoryProvider):
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         # Always apply temporal decay: stale facts lose trust over time.
+        # This runs regardless of auto_extract — it's a hygiene operation.
         self._apply_temporal_decay()
 
-        # Auto-resolve any pending corrections that were flagged but not cleared
-        if self._store:
-            self._auto_resolve_pending_corrections()
-
+        # is_truthy_value: the config schema declares auto_extract as a string
+        # enum ("false"/"true"), and a plain truthiness check treats the string
+        # "false" as enabled (#57682).
         if not is_truthy_value(self._config.get("auto_extract", False)):
             return
         if not self._store or not messages:
             return
         self._auto_extract_facts(messages)
-
-    def _auto_resolve_pending_corrections(self) -> int:
-        """Auto-resolve facts still tagged correction:pending.
-
-        For each pending fact, search for another fact sharing the same entity
-        but with a different value — this is the "correct" version. If found,
-        auto-resolve: boost the correct one (+0.05), demote the pending one
-        (-0.15 or delete if trust < 0.2). This cleans up corrections that
-        weren't resolved immediately because the entity-value match was
-        ambiguous at detection time.
-        """
-        if not self._store:
-            return 0
-
-        conn = self._store._conn
-        pending = conn.execute(
-            "SELECT fact_id, content, trust_score, tags FROM facts "
-            "WHERE tags LIKE '%correction:pending%'"
-        ).fetchall()
-
-        if not pending:
-            return 0
-
-        resolved = 0
-        for p_row in pending:
-            p_id, p_content, p_trust, p_tags = p_row
-
-            # Extract entities from this pending fact
-            p_entities = {}
-            for m in self._ENTITY_VALUE_RE.finditer(p_content):
-                p_entities[m.group(1)] = m.group(2)
-
-            if not p_entities:
-                continue
-
-            # Search for a "correct" version: same entity, different value, no pending tag
-            for entity, p_val in p_entities.items():
-                candidates = conn.execute(
-                    "SELECT fact_id, content, trust_score, tags FROM facts "
-                    "WHERE fact_id != ? AND content LIKE ? "
-                    "AND tags NOT LIKE '%correction:pending%' "
-                    "ORDER BY trust_score DESC LIMIT 5",
-                    (p_id, f"%{entity}%"),
-                ).fetchall()
-
-                for c_row in candidates:
-                    c_id, c_content, c_trust, c_tags = c_row
-                    c_entities = {}
-                    for m in self._ENTITY_VALUE_RE.finditer(c_content):
-                        c_entities[m.group(1)] = m.group(2)
-
-                    if entity in c_entities and c_entities[entity] != p_val:
-                        # Found a contradicting pair → auto-resolve
-                        self.resolve_contradiction(c_id, p_id)
-                        resolved += 1
-                        break  # One resolution per pending fact
-
-                if resolved > 0:
-                    break  # Already resolved this pending fact
-
-        if resolved:
-            conn.commit()
-
-        return resolved
 
     def _apply_temporal_decay(self, days_threshold: int = 60) -> int:
         """Reduce trust_score for facts not updated in `days_threshold` days.
@@ -858,6 +802,14 @@ class HolographicMemoryProvider(MemoryProvider):
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
+            elif action == "resolve":
+                correct_id = int(args.get("correct_fact_id", 0))
+                wrong_id = int(args.get("wrong_fact_id", 0))
+                if not correct_id or not wrong_id:
+                    return tool_error("resolve requires 'correct_fact_id' and 'wrong_fact_id'")
+                result = self.resolve_contradiction(correct_id, wrong_id)
+                return json.dumps(result)
+
             elif action == "update":
                 updated = store.update_fact(
                     int(args["fact_id"]),
@@ -935,10 +887,21 @@ class HolographicMemoryProvider(MemoryProvider):
             re.compile(r'\bI\s+(?:prefer|like|love|use|want|need)\s+(.+)', re.IGNORECASE),
             re.compile(r'\bmy\s+(?:favorite|preferred|default)\s+\w+\s+is\s+(.+)', re.IGNORECASE),
             re.compile(r'\bI\s+(?:always|never|usually)\s+(.+)', re.IGNORECASE),
+            # Chinese preference / personal habit patterns
+            re.compile(r'(?:我|阿锋).{0,10}(?:喜欢|习惯|一般|通常|总是|从来|基本).{2,30}(?:用|做|选|设|是)'),
+            re.compile(r'(?:我|阿锋).{0,5}(?:偏好|倾向|首选|默认)'),
+            re.compile(r'(?:我的|我们的).{2,20}(?:是|用|设|选|放在)'),
+            re.compile(r'(?:以后|接下来|从现在起).{2,30}(?:都|要|用|按)'),
+            re.compile(r'(?:禁止|不允许|不要|别).{0,10}(?:用|做|设|改)'),
         ]
         _DECISION_PATTERNS = [
             re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+(?:to\s+)?(.+)', re.IGNORECASE),
             re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+(.+)', re.IGNORECASE),
+            # Chinese decision / project patterns
+            re.compile(r'(?:我们|方案).{0,10}(?:决定|确定|选择|采用)'),
+            re.compile(r'(?:项目|系统|代码).{0,5}(?:使用|采用|依赖|基于)'),
+            re.compile(r'(?:最终|结论|所以).{0,10}(?:方案|做法|方式)'),
+            re.compile(r'(?:已|已经|前面).{0,5}(?:确认|验证|测试).{0,10}(?:通过|没问题|正常)'),
         ]
 
         extracted = 0
