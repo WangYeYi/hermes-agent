@@ -199,71 +199,7 @@ class MemoryStore:
             self._conn.execute("ALTER TABLE facts ADD COLUMN mention_count INTEGER DEFAULT 0")
         if "last_mentioned_at" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN last_mentioned_at TIMESTAMP")
-        # Migrate: CJK bigram FTS5 — replace content-indexed FTS5 with
-        # fts_content-indexed FTS5 so Chinese/Japanese/Korean substring
-        # queries work.  Existing databases have FTS5 on the `content`
-        # column which treats CJK runs as single indivisible tokens.
-        if "fts_content" not in columns:
-            self._conn.execute("ALTER TABLE facts ADD COLUMN fts_content TEXT DEFAULT ''")
-            columns.add("fts_content")
-        # Check whether FTS5 is still on the old `content` column.
-        fts_cols = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(facts_fts)").fetchall()
-        }
-        if "content" in fts_cols and "fts_content" not in fts_cols:
-            # Rebuild: migrate from old content-indexed FTS5 to
-            # fts_content-indexed FTS5 for CJK bigram support.
-            # Step 1: populate fts_content for existing rows first
-            from plugins.memory.holographic.retrieval import FactRetriever
-            rows = self._conn.execute(
-                "SELECT fact_id, content FROM facts"
-            ).fetchall()
-            for row in rows:
-                fts_val = FactRetriever._cjk_to_fts5_bigrams(row["content"])
-                self._conn.execute(
-                    "UPDATE facts SET fts_content = ? WHERE fact_id = ?",
-                    (fts_val, row["fact_id"]),
-                )
-            self._conn.commit()
-            # Step 2: drop old FTS5 + triggers
-            self._conn.execute("DROP TABLE IF EXISTS facts_fts")
-            for trigger in ("facts_ai", "facts_ad", "facts_au"):
-                self._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-            self._conn.commit()
-            # Step 3: create new FTS5 with content='' (standalone mode —
-            # avoids content-table column-name caching issues after migration)
-            self._conn.execute(
-                "CREATE VIRTUAL TABLE facts_fts USING fts5("
-                "fts_content, tags, content='')"
-            )
-            self._conn.execute(
-                "CREATE TRIGGER facts_ai AFTER INSERT ON facts BEGIN "
-                "INSERT INTO facts_fts(rowid, fts_content, tags) "
-                "VALUES (new.fact_id, new.fts_content, new.tags); END"
-            )
-            self._conn.execute(
-                "CREATE TRIGGER facts_ad AFTER DELETE ON facts BEGIN "
-                "INSERT INTO facts_fts(facts_fts, rowid, fts_content, tags) "
-                "VALUES ('delete', old.fact_id, old.fts_content, old.tags); END"
-            )
-            self._conn.execute(
-                "CREATE TRIGGER facts_au AFTER UPDATE ON facts BEGIN "
-                "INSERT INTO facts_fts(facts_fts, rowid, fts_content, tags) "
-                "VALUES ('delete', old.fact_id, old.fts_content, old.tags); "
-                "INSERT INTO facts_fts(rowid, fts_content, tags) "
-                "VALUES (new.fact_id, new.fts_content, new.tags); END"
-            )
-            # Rebuild FTS5 index: insert all existing rows
-            rows2 = self._conn.execute(
-                "SELECT fact_id, fts_content, tags FROM facts"
-            ).fetchall()
-            for r2 in rows2:
-                self._conn.execute(
-                    "INSERT INTO facts_fts(rowid, fts_content, tags) VALUES (?, ?, ?)",
-                    (r2["fact_id"], r2["fts_content"], r2["tags"] or ""),
-                )
-            self._conn.commit()
+        self._conn.commit()
 
         # Lazy-load ONNX embedder (Chinese-optimized, zero PyTorch)
         try:
@@ -509,7 +445,9 @@ class MemoryStore:
 
             sql = f"""
                 SELECT fact_id, content, category, tags, trust_score,
-                       retrieval_count, helpful_count, created_at, updated_at
+                       retrieval_count, helpful_count,
+                       mention_count, last_mentioned_at,
+                       created_at, updated_at
                 FROM facts
                 WHERE trust_score >= ?
                   {category_clause}
