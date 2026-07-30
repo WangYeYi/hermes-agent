@@ -353,7 +353,15 @@ TASK_COMPLETION_GUIDANCE = (
     "approach, ask the user). NEVER substitute plausible-looking fabricated "
     "output (made-up data, invented file contents, synthesised API responses) "
     "for results you couldn't actually produce. Reporting a blocker honestly "
-    "is always better than inventing a result."
+    "is always better than inventing a result.\n"
+    "\n"
+    "# Thinking vs visible response\n"
+    "Your thinking block is shown to the user in a dimmed style — it is a "
+    "scratchpad for analysis. The visible (white) response is the primary "
+    "output and must be self-contained: synthesize a complete, well-organized "
+    "summary. If the user asks N questions, the visible response must address "
+    "all N, even if the thinking layer already covered them. Never skip an "
+    "answer in the visible response just because it appeared in thinking."
 )
 
 # Universal parallel-tool-call guidance — applied to ALL models.
