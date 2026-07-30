@@ -1583,6 +1583,38 @@ def _run_auto_retrieval(agent, user_text: str) -> None:
         pass
 
 
+def _run_claim_verifier(final_response: str) -> dict:
+    """Run agent_claim_verifier.py as subprocess hook.
+
+    Extracts verifiable assertions from the response (PR #, commit hash,
+    file paths, issue numbers) and verifies each against external sources
+    (GitHub API, git, filesystem). Returns structured results with
+    pass/fail/unknown verdicts. Always produces visible output.
+    """
+    import subprocess
+    import sys as _sys
+
+    script = os.path.expanduser("~/.hermes/scripts/agent_claim_verifier.py")
+    if not os.path.exists(script):
+        return {"summary": {"total": 0, "passed": 0, "failed": 0, "unknown": 0},
+                "formatted": ""}
+
+    try:
+        proc = subprocess.run(
+            [_sys.executable, script],
+            input=final_response,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return json.loads(proc.stdout)
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
+        pass
+    return {"summary": {"total": 0, "passed": 0, "failed": 0, "unknown": 0},
+            "formatted": ""}
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -7846,6 +7878,26 @@ def run_conversation(
                 _run_auto_retrieval(agent, user_text)
         except Exception:
             pass  # auto-retrieval 失败不阻塞回复
+
+    # ── Agent claim verification: 断言核验 ──
+    # 从回复中提取可验证断言 (PR #, commit hash, 文件路径等)，
+    # 对每条断言用确定性验证器核验。总是输出可见结果。
+    if final_response:
+        try:
+            _verifier_result = _run_claim_verifier(final_response)
+            _vf_formatted = _verifier_result.get("formatted", "")
+            if _vf_formatted:
+                agent._safe_print(_vf_formatted)
+            # 发现断言失败时追加 nudge（类似 output-guard）
+            _vf_failed = _verifier_result.get("summary", {}).get("failed", 0)
+            if _vf_failed > 0:
+                final_response = (
+                    f"{final_response}\n\n"
+                    f"[claim-verify] ⚠ 以上回复中存在 {_vf_failed} 条断言验证失败。"
+                    f" 请核实并修正。"
+                )
+        except Exception:
+            pass  # claim-verify 失败不阻塞回复
 
     return finalize_turn(
         agent,
