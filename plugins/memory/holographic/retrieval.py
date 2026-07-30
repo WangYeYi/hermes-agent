@@ -7,6 +7,7 @@ Jaccard similarity reranking and trust-weighted scoring.
 from __future__ import annotations
 
 import math
+import re
 import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -882,6 +883,43 @@ class FactRetriever:
                 tokens.add(cleaned)
         return tokens
 
+    # CJK ranges for FTS5 pre-tokenization — same ranges as _tokenize()
+    _CJK_RE = re.compile(
+        r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff"
+        r"\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]+"
+    )
+
+    @classmethod
+    def _cjk_to_fts5_bigrams(cls, text: str) -> str:
+        """Pre-tokenize CJK text for FTS5: insert spaces between 2-grams.
+
+        SQLite FTS5's ``unicode61`` tokenizer treats a continuous run of CJK
+        characters as ONE indivisible token — a query for a substring (e.g.
+        ``배포`` inside ``배포는``, or ``刚才`` inside ``阿锋刚才说了什么``)
+        never matches.  This helper inserts spaces between character 2-grams
+        so FTS5 indexes each bigram as an independent token and substring
+        queries succeed.
+
+        ASCII spans pass through unchanged.
+        """
+        if not text:
+            return text
+        prev_end = 0
+        parts: list[str] = []
+        for m in cls._CJK_RE.finditer(text):
+            if m.start() > prev_end:
+                parts.append(text[prev_end : m.start()])
+            run = m.group()
+            if len(run) >= 2:
+                bigrams = [run[i : i + 2] for i in range(len(run) - 1)]
+                parts.append(" ".join(bigrams))
+            else:
+                parts.append(run)
+            prev_end = m.end()
+        if prev_end < len(text):
+            parts.append(text[prev_end:])
+        return "".join(parts)
+
     # Stopwords dropped before FTS5 OR-expansion. Short English function
     # words that carry no retrieval signal and force false-negative AND
     # matches when left in the query.
@@ -909,34 +947,52 @@ class FactRetriever:
 
         FTS5 treats a multi-word MATCH argument as AND-joined by default,
         which tanks recall on prose queries. This helper:
-          - tokenizes the query
-          - drops stopwords and short (<2 char) tokens
-          - strips FTS5 special characters from each token
-          - OR-joins the survivors
 
-        If nothing remains (pathological query), falls back to the raw
-        query so the caller sees zero results instead of a SQL error.
+          - Splits CJK runs into character 2-gram prefix tokens so they
+            match bigram-spaced FTS5 content (see _cjk_to_fts5_bigrams).
+          - For ASCII spans: tokenizes, drops stopwords and short tokens,
+            strips FTS5 special characters.
+          - OR-joins all tokens.
+
+        If nothing remains, falls back to the raw query so the caller sees
+        zero results instead of a SQL error.
         """
         if not query:
             return ""
-        # Strip FTS5 operator characters from EACH token to avoid
-        # accidentally creating a malformed query.
-        _FTS_SPECIAL = '"()*^:-+'
+        _FTS_SPECIAL = '\"()*^:-+'
         tokens: list[str] = []
-        for raw in query.lower().split():
-            cleaned = raw.strip(".,;:!?\"'()[]{}#@<>") .translate(
+
+        # Split into alternating CJK / non-CJK spans
+        prev_end = 0
+        for m in cls._CJK_RE.finditer(query):
+            # ASCII span before this CJK run
+            ascii_span = query[prev_end : m.start()]
+            for raw in ascii_span.lower().split():
+                cleaned = raw.strip(".,;:!?\"'()[]{}#@<>").translate(
+                    str.maketrans("", "", _FTS_SPECIAL)
+                )
+                if len(cleaned) >= 2 and cleaned not in cls._FTS_STOPWORDS:
+                    tokens.append(f'"{cleaned}"')
+            # CJK run → 2-gram prefix tokens
+            run = m.group()
+            if len(run) >= 2:
+                for i in range(len(run) - 1):
+                    bigram = run[i : i + 2]
+                    tokens.append(f'"{bigram}"')
+            elif len(run) == 1:
+                tokens.append(f'"{run}"')
+            prev_end = m.end()
+
+        # Trailing ASCII after last CJK run
+        for raw in query[prev_end:].lower().split():
+            cleaned = raw.strip(".,;:!?\"'()[]{}#@<>").translate(
                 str.maketrans("", "", _FTS_SPECIAL)
             )
-            if len(cleaned) < 2:
-                continue
-            if cleaned in cls._FTS_STOPWORDS:
-                continue
-            # FTS5 phrase-literal each token to ensure no special chars
-            # sneak through as operators.
-            tokens.append(f'"{cleaned}"')
+            if len(cleaned) >= 2 and cleaned not in cls._FTS_STOPWORDS:
+                tokens.append(f'"{cleaned}"')
+
         if not tokens:
-            # Fallback: raw query (likely returns 0, but never crashes)
-            return query
+            return query  # fallback, likely returns 0 but never crashes
         return " OR ".join(tokens)
 
     @staticmethod
