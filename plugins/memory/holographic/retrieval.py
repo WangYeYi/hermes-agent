@@ -561,15 +561,41 @@ class FactRetriever:
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
-        """Simple whitespace tokenization with lowercasing.
+        """Tokenize text into a set of indexable terms.
 
-        Strips common punctuation. No stemming/lemmatization (Phase 1).
+        English/ASCII: whitespace-split, lowercased, punctuation-stripped.
+        CJK (Chinese/Japanese/Korean): character 2-grams + standalone
+        alphanumeric substrings extracted from CJK runs.
+
+        This hybrid approach ensures both English keywords and Chinese
+        phrases are searchable with Jaccard overlap — without requiring
+        a segmenter or dictionary.
         """
         if not text:
             return set()
-        # Split on whitespace, lowercase, strip punctuation
-        tokens = set()
-        for word in text.lower().split():
+        tokens: set[str] = set()
+        # ── CJK 2-gram extraction ──
+        # Split into alternating runs: ASCII-or-digit spans vs CJK spans.
+        import re as _re
+        cjk = _re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]+")
+        prev_end = 0
+        for m in cjk.finditer(text):
+            # Emit ASCII tokens before this CJK span (whitespace-split)
+            ascii_span = text[prev_end : m.start()]
+            for word in ascii_span.lower().split():
+                cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
+                if cleaned:
+                    tokens.add(cleaned)
+            # CJK run → character 2-grams
+            run = m.group()
+            for i in range(len(run) - 1):
+                tokens.add(run[i : i + 2])
+            # Also add single characters for short matches
+            for ch in run:
+                tokens.add(ch)
+            prev_end = m.end()
+        # Remaining ASCII after last CJK run
+        for word in text[prev_end:].lower().split():
             cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
             if cleaned:
                 tokens.add(cleaned)
