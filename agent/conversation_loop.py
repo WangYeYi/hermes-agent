@@ -1118,7 +1118,8 @@ def _split_user_items(text: str) -> list[str]:
         if len(sub) >= 2:
             return sub
         # Try comma-separated compound questions: "A，B，C？"
-        if "，" in text and "？" in text:
+        # Try comma-separated compound questions: "A，B，C？"
+        if "，" in text and re.search(r'[？?吗呢]|怎么|如何|是不是|能不能', text):
             comma_parts = re.split(r'[，,]', text)
             question_pattern = r'[？?吗呢]|怎么|如何|是不是|能不能|要不要|会不会|有没有|是否|怎样|几个|多少'
             if sum(1 for p in comma_parts if re.search(question_pattern, p)) >= 1:
@@ -1166,14 +1167,14 @@ def _guard_write_log(entry: dict) -> None:
     try:
         os.makedirs(os.path.dirname(_GUARD_LOG_PATH), exist_ok=True)
         now = time.time()
-        with open(_GUARD_LOG_PATH, "a") as f:
+        with open(_GUARD_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         # 低频清理：每小时最多一次
         if os.path.getmtime(_GUARD_LOG_PATH) < now - 3600:
             cutoff = now - _GUARD_LOG_MAX_AGE
             try:
                 tmp = _GUARD_LOG_PATH + ".tmp"
-                with open(_GUARD_LOG_PATH) as fin, open(tmp, "w") as fout:
+                with open(_GUARD_LOG_PATH, encoding="utf-8") as fin, open(tmp, "w", encoding="utf-8") as fout:
                     for line in fin:
                         try:
                             e = json.loads(line)
@@ -1356,7 +1357,17 @@ def _run_output_guard(agent, final_response: str, original_user_message: Any) ->
             for r in l2_results
             if not r.get("covered")
         ]
-        uncertain_for_l3 = list(dict.fromkeys(l2_missed + missed))  # 合并去重
+        # L2 判 covered 但 sim 低于不确定阈值的条目也送 L3
+        # （MiniLM 68% 准确率不可靠，低 sim 的"covered"可能是误判）
+        UNCERTAIN_SIM = 0.25
+        l2_uncertain = [
+            remaining[r["index"] - 1]
+            for r in l2_results
+            if r.get("covered") and r.get("similarity", 0) < UNCERTAIN_SIM
+        ]
+        log_entry["l2"]["uncertain_threshold"] = UNCERTAIN_SIM
+        log_entry["l2"]["uncertain_indices"] = l2_uncertain
+        uncertain_for_l3 = list(dict.fromkeys(l2_missed + l2_uncertain + missed))  # 合并去重
 
     if not uncertain_for_l3:
         _guard_write_log(log_entry)
@@ -1371,6 +1382,10 @@ def _run_output_guard(agent, final_response: str, original_user_message: Any) ->
         log_entry["verdict"] = "MISSING"
     _guard_write_log(log_entry)
     return final_missed
+
+# 跨轮 nudge 去重：同一组遗漏不反复注入（思考里补充了但正文没体现 → 死循环）
+_LAST_GUARD_NUDGES: set[str] = set()
+
 
 def _format_guard_nudge(missed_indices: list[int]) -> str:
     """格式化遗漏提醒 — 作为系统级指令注入，非引用块"""
@@ -7372,10 +7387,55 @@ def run_conversation(
             agent._safe_print(
                 f"\n⚠️  [output-guard] 检测到遗漏 {items_str}，已追加提醒"
             )
-            # Inject nudge into final_response so model can supplement
+            # Inject nudge as a hidden system message into conversation
+            # history so the model sees it next turn, but do NOT append
+            # it to the user-visible final_response (avoid ugly SYSTEM
+            # INSTRUCTION text leaking into the terminal output).
             nudge = _format_guard_nudge(_guard_missing)
-            if nudge and nudge not in final_response:
-                final_response = final_response.rstrip() + nudge
+            if nudge:
+                import hashlib as _hl
+                _nudge_key = _hl.md5(nudge.encode()).hexdigest()
+                if _nudge_key not in _LAST_GUARD_NUDGES:
+                    _LAST_GUARD_NUDGES.add(_nudge_key)
+                    if nudge not in final_response:
+                        # Inject into conversation_history + messages as a
+                        # hidden user message so the model processes it next
+                        # turn, without the user seeing ugly SYSTEM
+                        # INSTRUCTION text in the terminal.
+                        nudge_msg = {"role": "user", "content": nudge.strip()}
+                        conversation_history.append(nudge_msg)
+                        try:
+                            messages.append(nudge_msg)
+                        except (TypeError, AttributeError):
+                            pass
+
+    # ── Factual claim verification: MiniLM claim detection + gh/shell cross-check ──
+    if final_response and not final_response.startswith("I apologize"):
+        try:
+            import subprocess as _fc_sp
+            _fc_result = _fc_sp.run(
+                ["python3", os.path.expanduser("~/.hermes/scripts/verify_factual_claims.py")],
+                input=final_response, capture_output=True, timeout=15, text=True
+            )
+            if _fc_result.returncode == 0:
+                _fc_claims = json.loads(_fc_result.stdout)
+                if _fc_claims:
+                    # Separate verified false claims from unverifiable ones
+                    _fc_false = [c for c in _fc_claims if c.get("entity") != "?"]
+                    _fc_unknown = [c for c in _fc_claims if c.get("entity") == "?"]
+                    lines = []
+                    if _fc_false:
+                        lines.append("⚠️  [fact-check] 以下断言与实际情况不符：")
+                        for c in _fc_false:
+                            lines.append(f"  · {c['entity']}: 声称的与实测不符 → {c['actual']}")
+                    if _fc_unknown:
+                        lines.append("⚠️  [fact-check] 以下断言无法自动验证，请确认：")
+                        for c in _fc_unknown:
+                            lines.append(f"  · {c['claim']}")
+                    if lines:
+                        agent._safe_print("\n" + "\n".join(lines))
+        except Exception:
+            pass  # non-critical
 
     return finalize_turn(
         agent,

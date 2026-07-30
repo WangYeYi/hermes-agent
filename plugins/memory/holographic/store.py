@@ -6,12 +6,15 @@ Single-user Hermes memory store plugin.
 import re
 import sqlite3
 import threading
+import logging
 from pathlib import Path
 
 try:
     from . import holographic as hrr
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
+
+logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -24,7 +27,8 @@ CREATE TABLE IF NOT EXISTS facts (
     helpful_count   INTEGER DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    hrr_vector      BLOB
+    hrr_vector      BLOB,
+    onnx_vector     BLOB
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -72,6 +76,12 @@ CREATE TABLE IF NOT EXISTS memory_banks (
     dim        INTEGER NOT NULL,
     fact_count INTEGER DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Persist configuration that must be stable across sessions.
+CREATE TABLE IF NOT EXISTS _meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 """
 
@@ -127,6 +137,8 @@ class MemoryStore:
         self.default_trust = _clamp_trust(default_trust)
         self.hrr_dim = hrr_dim
         self._hrr_available = hrr._HAS_NUMPY
+        self._onnx_available = False
+        self._onnx = None
 
         # Acquire (or open) the process-wide shared connection for this DB.
         # resolve() (not just expanduser) so symlinked/relative paths to the
@@ -163,6 +175,35 @@ class MemoryStore:
                 self._init_db()
                 self._entry["ready"] = True
 
+        # Always adopt the stored hrr_dim so subsequent instances (which
+        # skip _init_db because the shared connection is already ready)
+        # cannot accidentally drift from the persisted value.
+        row = self._conn.execute(
+            "SELECT value FROM _meta WHERE key = 'hrr_dim'"
+        ).fetchone()
+        if row is not None:
+            stored_dim = int(row["value"])
+            if stored_dim != self.hrr_dim:
+                self.hrr_dim = stored_dim
+
+        # After adopting the persisted hrr_dim, check whether any memory
+        # banks were built with a different dimension.  A mismatch means
+        # the banks are stale and should be rebuilt.
+        bank_rows = self._conn.execute(
+            "SELECT DISTINCT dim FROM memory_banks"
+        ).fetchall()
+        if bank_rows:
+            bank_dims = {row["dim"] for row in bank_rows}
+            if self.hrr_dim not in bank_dims:
+                logger.warning(
+                    "Memory bank dimension mismatch: banks are at "
+                    "dim=%s but current hrr_dim=%d.  Bank-based "
+                    "retrieval (probe) will be degraded.  Run "
+                    "rebuild_all_vectors() to migrate.",
+                    sorted(bank_dims),
+                    self.hrr_dim,
+                )
+
     # ------------------------------------------------------------------
     # Initialisation
     # ------------------------------------------------------------------
@@ -179,6 +220,42 @@ class MemoryStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+        if "onnx_vector" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN onnx_vector BLOB")
+        # Migrate: mention_count + last_mentioned_at for automatic trust
+        # weighting based on real conversation references (not just retrieval).
+        if "mention_count" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN mention_count INTEGER DEFAULT 0")
+        if "last_mentioned_at" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN last_mentioned_at TIMESTAMP")
+        self._conn.commit()
+
+        # Lazy-load ONNX embedder (Chinese-optimized, zero PyTorch)
+        try:
+            from .onnx_embed import OnnxEmbedder
+        except ImportError:
+            try:
+                from onnx_embed import OnnxEmbedder
+            except ImportError:
+                return
+        self._onnx = OnnxEmbedder()
+        self._onnx_available = self._onnx.available
+
+        # Persist hrr_dim so it cannot drift across sessions.
+        row = self._conn.execute(
+            "SELECT value FROM _meta WHERE key = 'hrr_dim'"
+        ).fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO _meta (key, value) VALUES ('hrr_dim', ?)",
+                (str(self.hrr_dim),),
+            )
+        else:
+            stored_dim = int(row["value"])
+            if stored_dim != self.hrr_dim:
+                # Config changed — adopt the stored value so existing vectors
+                # stay comparable.  The config value is only used on first run.
+                self.hrr_dim = stored_dim
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -226,6 +303,7 @@ class MemoryStore:
 
             # Compute HRR vector after entity linking
             self._compute_hrr_vector(fact_id, content)
+            self._compute_onnx_vector(fact_id, content)
             self._rebuild_bank(category)
 
             return fact_id
@@ -344,6 +422,7 @@ class MemoryStore:
             # Recompute HRR vector if content changed
             if content is not None:
                 self._compute_hrr_vector(fact_id, content)
+            self._compute_onnx_vector(fact_id, content)
             # Rebuild bank for relevant category
             cat = category or self._conn.execute(
                 "SELECT category FROM facts WHERE fact_id = ?", (fact_id,)
@@ -389,7 +468,9 @@ class MemoryStore:
 
             sql = f"""
                 SELECT fact_id, content, category, tags, trust_score,
-                       retrieval_count, helpful_count, created_at, updated_at
+                       retrieval_count, helpful_count,
+                       mention_count, last_mentioned_at,
+                       created_at, updated_at
                 FROM facts
                 WHERE trust_score >= ?
                   {category_clause}
@@ -544,6 +625,22 @@ class MemoryStore:
             )
             self._conn.commit()
 
+    def _compute_onnx_vector(self, fact_id: int, content: str) -> None:
+        """Compute and store ONNX embedding for a fact. No-op if model unavailable."""
+        with self._lock:
+            if not self._onnx_available:
+                return
+            try:
+                import numpy as np
+                vec = self._onnx.embed(content)
+                self._conn.execute(
+                    "UPDATE facts SET onnx_vector = ? WHERE fact_id = ?",
+                    (vec.astype(np.float32).tobytes(), fact_id),
+                )
+                self._conn.commit()
+            except Exception:
+                pass
+
     def _rebuild_bank(self, category: str) -> None:
         """Full rebuild of a category's memory bank from all its fact vectors."""
         with self._lock:
@@ -561,7 +658,28 @@ class MemoryStore:
                 self._conn.commit()
                 return
 
-            vectors = [hrr.bytes_to_phases(row["hrr_vector"]) for row in rows]
+            # Use safe_vec to skip facts encoded with a different hrr_dim.
+            vectors: list = []
+            skipped = 0
+            for row in rows:
+                vec = hrr.safe_vec(row["hrr_vector"], self.hrr_dim)
+                if vec is not None:
+                    vectors.append(vec)
+                else:
+                    skipped += 1
+            if skipped:
+                logger.warning(
+                    "Skipped %d fact(s) with mismatched hrr_dim during bank "
+                    "rebuild for category=%r.  These facts were encoded with "
+                    "a different hrr_dim and should be migrated via "
+                    "rebuild_all_vectors().",
+                    skipped,
+                    category,
+                )
+            if not vectors:
+                self._conn.execute("DELETE FROM memory_banks WHERE bank_name = ?", (bank_name,))
+                self._conn.commit()
+                return
             bank_vector = hrr.bundle(*vectors)
             fact_count = len(vectors)
 
@@ -593,6 +711,13 @@ class MemoryStore:
 
             if dim is not None:
                 self.hrr_dim = dim
+                # Persist the new dimension so subsequent sessions adopt it.
+                self._conn.execute(
+                    "INSERT INTO _meta (key, value) VALUES ('hrr_dim', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (str(self.hrr_dim),),
+                )
+                self._conn.commit()
 
             rows = self._conn.execute(
                 "SELECT fact_id, content, category FROM facts"
@@ -601,6 +726,7 @@ class MemoryStore:
             categories: set[str] = set()
             for row in rows:
                 self._compute_hrr_vector(row["fact_id"], row["content"])
+                self._compute_onnx_vector(row["fact_id"], row["content"])
                 categories.add(row["category"])
 
             for category in categories:
