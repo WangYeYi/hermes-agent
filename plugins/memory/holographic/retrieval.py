@@ -855,7 +855,7 @@ class FactRetriever:
 
         SQLite FTS5's ``unicode61`` tokenizer treats a continuous run of CJK
         characters as ONE indivisible token — a query for a substring (e.g.
-        ``배포`` inside ``배포는``, or ``刚才`` inside ``阿锋刚才说了什么``)
+        ``배포`` inside ``배포는``, or ``刚才`` inside ``小明刚才说了什么``)
         never matches.  This helper inserts spaces between character 2-grams
         so FTS5 indexes each bigram as an independent token and substring
         queries succeed.
