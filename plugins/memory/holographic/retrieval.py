@@ -872,13 +872,13 @@ class FactRetriever:
             run = m.group()
             if len(run) >= 2:
                 bigrams = [run[i : i + 2] for i in range(len(run) - 1)]
-                parts.append(" ".join(bigrams))
+                parts.append(" " + " ".join(bigrams) + " ")
             else:
-                parts.append(run)
+                parts.append(" " + run + " ")
             prev_end = m.end()
         if prev_end < len(text):
             parts.append(text[prev_end:])
-        return "".join(parts)
+        return "".join(parts).strip()
 
     # Stopwords dropped before FTS5 OR-expansion. Short English function
     # words that carry no retrieval signal and force false-negative AND
