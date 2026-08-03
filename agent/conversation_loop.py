@@ -1384,7 +1384,7 @@ def _run_output_guard(agent, final_response: str, original_user_message: Any) ->
     返回遗漏的条目索引列表（1-based），无遗漏返回 []。
     每次检查写入 JSONL 日志到 ~/.hermes/logs/output-guard.jsonl。
     """
-    if not final_response or final_response.startswith("I apologize"):
+    if not final_response:
         return []
     user_text = _flatten_user_text(original_user_message)
     if not user_text:
@@ -7875,25 +7875,144 @@ def run_conversation(
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
 
+    # ── Empty response recovery: if agent returned no visible text after
+    #    executing tool calls, re-prompt with the user's original message.
+    #    This catches the "tool calls returned, thinking completed, but
+    #    visible response was empty" bug pattern.
+    if (
+        not final_response.strip()
+        and messages
+        and any(
+            isinstance(m, dict) and m.get("role") == "tool"
+            for m in messages[-10:]
+        )
+    ):
+        agent._safe_print(
+            "\n⚠️  [output-guard] 检测到空响应（刚执行过工具调用），正在恢复..."
+        )
+        _empty_nudge = (
+            "[SYSTEM INSTRUCTION] Your previous visible response was empty "
+            "after executing tool calls. You MUST produce a complete, "
+            "self-contained answer that synthesizes all tool results. "
+            "The thinking block is for analysis only — the visible "
+            "response is where the user sees your answer.\n\n"
+            "Please re-read the user's question and provide a full answer "
+            "based on the tool results you just received."
+        )
+        _empty_msg = {"role": "user", "content": _empty_nudge,
+                      "_empty_recovery_synthetic": True}
+        conversation_history.append(_empty_msg)
+        try:
+            messages.append(_empty_msg)
+        except (TypeError, AttributeError):
+            pass
+        try:
+            _empty_stream = agent.client.chat_completion(
+                model=agent.model,
+                messages=[m for m in messages
+                          if isinstance(m, dict) and "role" in m],
+                stream=True,
+            )
+            _recovered = ""
+            for _chunk in _empty_stream:
+                if hasattr(_chunk, "content") and _chunk.content:
+                    _recovered += _chunk.content
+                    agent._safe_print(_chunk.content, end="", flush=True)
+            agent._safe_print("")
+            if _recovered.strip():
+                final_response = _recovered.strip()
+            else:
+                final_response = (
+                    "I apologize, but I was unable to produce a response "
+                    "after executing those tools. Could you rephrase your "
+                    "question?"
+                )
+        except Exception as _ee:
+            logger.warning(f"empty-response recovery failed: {_ee}")
+            final_response = (
+                "I encountered an error while trying to recover from an "
+                "empty response. Please try asking again."
+            )
+
     # ── Output guard: check coverage after turn completes ──
+    # ── Output guard: code-level retry loop (was: nudge-only injection) ──
+    _GUARD_MAX_RETRIES = 3
     _guard_missing: list[int] = []
+    _guard_retries = 0
+
     if (
         final_response
-        and not final_response.startswith("I apologize")
         and original_user_message is not None
     ):
-        _guard_missing = _run_output_guard(
-            agent, final_response, original_user_message
-        )
+        while _guard_retries < _GUARD_MAX_RETRIES:
+            _guard_missing = _run_output_guard(
+                agent, final_response, original_user_message
+            )
+            if not _guard_missing:
+                break  # ✅ 全部覆盖
+
+            _guard_retries += 1
+            items_str = "、".join(f"第{i}条" for i in _guard_missing)
+            agent._safe_print(
+                f"\n⚠️  [output-guard] 检测到遗漏 {items_str}，"
+                f"第{_guard_retries}/{_GUARD_MAX_RETRIES}次重试..."
+            )
+
+            # 从 original_user_message 提取遗漏条目的原始文本
+            user_text = _flatten_user_text(original_user_message)
+            all_items = _split_user_items(user_text)
+            missed_texts = []
+            for idx in _guard_missing:
+                if idx <= len(all_items):
+                    missed_texts.append(f"  {idx}. {all_items[idx-1][:200]}")
+            missed_block = "\n".join(missed_texts) if missed_texts else ""
+
+            retry_prompt = (
+                f"[SYSTEM INSTRUCTION — 输出覆盖检查] 上一轮回答遗漏了以下"
+                f"用户问题，必须在本轮回答末尾逐一补充完整：\n\n"
+                f"{missed_block}\n\n"
+                f"要求：保持原有回答的全部内容，在末尾追加对以上遗漏问题的回答。"
+                f"不要省略或缩写。"
+            )
+
+            # 注入为隐藏 user message → 重新调模型
+            retry_msg = {"role": "user", "content": retry_prompt.strip(),
+                         "_guard_retry_synthetic": True}
+            conversation_history.append(retry_msg)
+            try:
+                messages.append(retry_msg)
+            except (TypeError, AttributeError):
+                pass
+
+            # ── 重新调用 agent 模型 ──
+            try:
+                _retry_stream = agent.client.chat_completion(
+                    model=agent.model,
+                    messages=[m for m in messages
+                              if isinstance(m, dict) and "role" in m],
+                    stream=True,
+                )
+                _new_response = ""
+                for _chunk in _retry_stream:
+                    if hasattr(_chunk, "content") and _chunk.content:
+                        _new_response += _chunk.content
+                        agent._safe_print(_chunk.content, end="", flush=True)
+                agent._safe_print("")
+                if _new_response.strip():
+                    final_response = final_response + "\n\n" + _new_response.strip()
+                else:
+                    break  # 空响应 → 不再重试
+            except Exception as _gr_err:
+                logger.warning(f"output-guard retry failed: {_gr_err}")
+                break
+
+        # 达到上限仍遗漏 → 注入 nudge 兜底（下次对话可见）
         if _guard_missing:
             items_str = "、".join(f"第{i}条" for i in _guard_missing)
             agent._safe_print(
-                f"\n⚠️  [output-guard] 检测到遗漏 {items_str}，已追加提醒"
+                f"\n⚠️  [output-guard] 已达最大重试次数({_GUARD_MAX_RETRIES})，"
+                f"仍遗漏 {items_str}"
             )
-            # Inject nudge as a hidden system message into conversation
-            # history so the model sees it next turn, but do NOT append
-            # it to the user-visible final_response (avoid ugly SYSTEM
-            # INSTRUCTION text leaking into the terminal output).
             nudge = _format_guard_nudge(_guard_missing)
             if nudge:
                 import hashlib as _hl
@@ -7901,11 +8020,8 @@ def run_conversation(
                 if _nudge_key not in _LAST_GUARD_NUDGES:
                     _LAST_GUARD_NUDGES.add(_nudge_key)
                     if nudge not in final_response:
-                        # Inject into conversation_history + messages as a
-                        # hidden user message so the model processes it next
-                        # turn, without the user seeing ugly SYSTEM
-                        # INSTRUCTION text in the terminal.
-                        nudge_msg = {"role": "user", "content": nudge.strip()}
+                        nudge_msg = {"role": "user", "content": nudge.strip(),
+                                     "_guard_nudge_synthetic": True}
                         conversation_history.append(nudge_msg)
                         try:
                             messages.append(nudge_msg)
