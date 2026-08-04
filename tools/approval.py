@@ -4130,6 +4130,18 @@ _EXEC_CODE_SUSPICIOUS_IMPORTS = frozenset({"ctypes"})
 _EXEC_CODE_DANGEROUS_BUILTINS = frozenset({"open"})
 
 
+def _log_blocked_exec_code(code: str, reason: str) -> None:
+    """Log a blocked execute_code script with redacted content."""
+    from agent.redact import redact_sensitive_text
+    truncated = code[:4000]
+    if len(code) > 4000:
+        truncated += f"\n... [truncated, {len(code)} total chars]"
+    logger.warning(
+        "execute_code BLOCKED (%s). Script (%d chars):\n%s",
+        reason, len(code), redact_sensitive_text(truncated),
+    )
+
+
 def _execute_code_has_dangerous_ops(code: str) -> bool:
     """Return True if *code* contains operations that bypass terminal()
     / DANGEROUS_PATTERNS approval: dangerous module.func calls,
@@ -4252,6 +4264,7 @@ def check_execute_code_guard(code: str, env_type: str,
     # Cron: no user is present to approve arbitrary code.
     if _is_cron_approval_context():
         if _get_cron_approval_mode() == "deny":
+            _log_blocked_exec_code(code, "cron-deny")
             return {
                 "approved": False,
                 "message": (
@@ -4285,6 +4298,7 @@ def check_execute_code_guard(code: str, env_type: str,
             return {"approved": True, "message": None}
         # Dangerous ops detected — fall through to approval prompt below
         # so the user can make an explicit decision.
+        _log_blocked_exec_code(code, "AST-dangerous-ops-CLI-fallthrough")
 
     session_key = get_current_session_key()
     # Built only now (past the early-return gates) so the common non-approval
@@ -4320,6 +4334,7 @@ def check_execute_code_guard(code: str, env_type: str,
         if verdict == "deny" and not (is_gateway or is_ask):
             _record_denial(session_key)
             breaker_addendum = _denial_breaker_addendum(session_key)
+            _log_blocked_exec_code(code, "smart-deny-non-interactive")
             return {
                 "approved": False,
                 "message": ("BLOCKED by smart approval: execute_code script "
@@ -4358,6 +4373,7 @@ def check_execute_code_guard(code: str, env_type: str,
     if notify_cb is None:
         # No gateway callback registered (e.g. ask-mode without a notifier):
         # surface a pending approval for backward compatibility.
+        _log_blocked_exec_code(code, "pending-approval-no-notifier")
         pending_data = {
             "command": display_command,
             "pattern_key": pattern_key,
@@ -4397,6 +4413,7 @@ def check_execute_code_guard(code: str, env_type: str,
         session_key, notify_cb, approval_data, surface="gateway"
     )
     if decision.get("notify_failed"):
+        _log_blocked_exec_code(code, "notify-failed")
         return {
             "approved": False,
             "message": ("BLOCKED: Failed to send execute_code approval request "
@@ -4413,6 +4430,7 @@ def check_execute_code_guard(code: str, env_type: str,
 
     if not resolved or choice is None or choice == "deny":
         reason = "timed out without user response" if not resolved else "denied by user"
+        _log_blocked_exec_code(code, f"approval-{reason.replace(' ', '-')}")
         addendum = " Silence is not consent." if not resolved else ""
         reason_addendum = ""
         if resolved and choice == "deny" and deny_reason:
