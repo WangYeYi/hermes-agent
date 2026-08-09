@@ -371,7 +371,7 @@ override-dependencies = [
 exclude-newer = "14 days"
 # h2: temporary exclude-newer exception for the CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg,
 # request-smuggling) fix in 4.4.1, published 2026-08-03. Remove after 2026-08-17.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false }
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, setuptools = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's
