@@ -81,6 +81,10 @@ class FactRetriever:
         self.jaccard_weight = jaccard_weight
         self.hrr_weight = hrr_weight
         self.onnx_weight = onnx_weight
+
+        # ONNX embedder (lazy — loaded by store, shared here)
+        self._onnx = getattr(store, '_onnx', None)
+        self._onnx_available = getattr(store, '_onnx_available', False)
         self.retrieval_weight = retrieval_weight
 
         # Track dimension mismatches for migration guidance.
@@ -430,7 +434,10 @@ class FactRetriever:
         scored = []
         for row in rows:
             fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
+            fact_vec = _safe_phases(fact.pop("hrr_vector"), self.hrr_dim)
+            if fact_vec is None:
+                skipped += 1
+                continue
 
             # Check structural similarity: unbind entity from fact
             residual = hrr.unbind(fact_vec, entity_vec)
@@ -513,7 +520,10 @@ class FactRetriever:
         scored = []
         for row in rows:
             fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
+            fact_vec = _safe_phases(fact.pop("hrr_vector"), self.hrr_dim)
+            if fact_vec is None:
+                skipped += 1
+                continue
 
             entity_scores = []
             for probe_key in entity_residuals:
@@ -612,8 +622,11 @@ class FactRetriever:
                     continue  # Not enough entity overlap to be contradictory
 
                 # Content similarity via HRR vectors
-                v1 = hrr.bytes_to_phases(f1["hrr_vector"], dim=self.hrr_dim)
-                v2 = hrr.bytes_to_phases(f2["hrr_vector"], dim=self.hrr_dim)
+                v1 = _safe_phases(f1["hrr_vector"], self.hrr_dim)
+                v2 = _safe_phases(f2["hrr_vector"], self.hrr_dim)
+                if v1 is None or v2 is None:
+                    skipped += 1
+                    continue
                 content_sim = hrr.similarity(v1, v2)
 
                 # High entity overlap + low content similarity = potential contradiction
@@ -684,7 +697,10 @@ class FactRetriever:
         scored = []
         for row in rows:
             fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
+            fact_vec = _safe_phases(fact.pop("hrr_vector"), self.hrr_dim)
+            if fact_vec is None:
+                skipped += 1
+                continue
             sim = hrr.similarity(target_vec, fact_vec)
             fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
             scored.append(fact)
