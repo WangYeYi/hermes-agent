@@ -431,6 +431,7 @@ class FactRetriever:
         # (deterministic SHA-256-based atoms) instead of twice per fact row.
         role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
         role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
+        skipped = 0
         scored = []
         for row in rows:
             fact = dict(row)
@@ -517,6 +518,7 @@ class FactRetriever:
         # (AND semantics via min, vs OR which would use mean/max).
         role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
 
+        skipped = 0
         scored = []
         for row in rows:
             fact = dict(row)
@@ -694,6 +696,7 @@ class FactRetriever:
             params,
         ).fetchall()
 
+        skipped = 0
         scored = []
         for row in rows:
             fact = dict(row)
