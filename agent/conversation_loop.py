@@ -7967,9 +7967,20 @@ def run_conversation(
     if final_response and not final_response.startswith("I apologize"):
         corrections = _run_fact_check(final_response)
         if corrections:
-            nudge = _format_fact_check_nudge(corrections)
-            if nudge:
-                agent._safe_print(nudge)
+            # Dual-classification display: verified-false vs unverifiable
+            _fc_false = [c for c in corrections if c.get("entity") != "?"]
+            _fc_unknown = [c for c in corrections if c.get("entity") == "?"]
+            lines = []
+            if _fc_false:
+                lines.append("⚠️  [fact-check] 以下断言与实际情况不符：")
+                for c in _fc_false:
+                    lines.append(f"  · {c['entity']}: 声称的与实测不符 → {c['actual']}")
+            if _fc_unknown:
+                lines.append("⚠️  [fact-check] 以下断言无法自动验证，请确认：")
+                for c in _fc_unknown:
+                    lines.append(f"  · {c['claim']}")
+            if lines:
+                agent._safe_print("\n" + "\n".join(lines))
             _apply_fact_check_feedback(agent, corrections)
 
     return finalize_turn(
