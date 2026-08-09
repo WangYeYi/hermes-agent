@@ -7605,8 +7605,16 @@ def run_conversation(
                 agent._safe_print("\n" + "\n".join(lines))
             _apply_fact_check_feedback(agent, corrections)
         else:
-            # All claims verified or no claims detected — never silent
-            agent._safe_print("✅ [fact-check] 未检测到问题断言")
+            # No issues found — distinguish verified vs no-claims
+            import re as _fc_re
+            _has_claims = bool(_fc_re.search(
+                r'(?:PR|Issue)\s*#\d+|commit\s+[0-9a-f]{7,40}|`[^`]+`|#\d{4,}',
+                final_response
+            ))
+            if _has_claims:
+                agent._safe_print("✅ [fact-check] 可验证断言均通过验证")
+            else:
+                agent._safe_print("ℹ️  [fact-check] 未检测到可验证断言")
 
     return finalize_turn(
         agent,
