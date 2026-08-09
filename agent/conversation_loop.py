@@ -1503,6 +1503,12 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # ── Auto-retrieval: drive retrieval_count so frequently-discussed topics
+    # rise in holographic memory rank over time.  Runs every turn, independent
+    # of agent tool calls; only the calling site was missing (v1.7.0 fix).
+    if isinstance(original_user_message, str):
+        _run_auto_retrieval(agent, original_user_message)
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
