@@ -1292,19 +1292,21 @@ def _apply_fact_check_feedback(agent, corrections: list[dict]) -> None:
 
     verified = [c for c in corrections if c.get("ok", False) and c.get("entity") != "?"]
     failed = [c for c in corrections if not c.get("ok", True) and c.get("entity") != "?"]
+    unknown = [c for c in corrections if c.get("entity") == "?"]
 
     up_lines = []
     down_lines = []
 
-    def _apply(entity, items, action, collector):
+    def _apply(entity_key, items, action, collector):
         for correction in items:
-            ent = correction.get("entity", "")
-            if not ent or len(ent) < 2:
+            # entity_key: "entity" for verified/failed, "claim" for unknown
+            ent = correction.get(entity_key, "")
+            if not ent or len(str(ent)) < 2:
                 continue
             try:
                 result_json = memory_manager.handle_tool_call(
                     "fact_store",
-                    {"action": "search", "query": ent, "limit": 3, "min_trust": 0.3},
+                    {"action": "search", "query": str(ent)[:200], "limit": 3, "min_trust": 0.3},
                 )
                 result = json.loads(result_json)
                 matches = result.get("results", [])
@@ -1322,8 +1324,9 @@ def _apply_fact_check_feedback(agent, corrections: list[dict]) -> None:
             except Exception:
                 pass
 
-    _apply("verified", verified, "helpful", up_lines)
-    _apply("failed", failed, "unhelpful", down_lines)
+    _apply("entity", verified, "helpful", up_lines)
+    _apply("entity", failed, "unhelpful", down_lines)
+    _apply("claim", unknown, "unhelpful", down_lines)
 
     if up_lines:
         agent._safe_print(
@@ -1332,7 +1335,7 @@ def _apply_fact_check_feedback(agent, corrections: list[dict]) -> None:
         )
     if down_lines:
         agent._safe_print(
-            "\n📉 [fact-check feedback] 与事实不符，已降低以下事实信任分：\n"
+            "\n📉 [fact-check feedback] 与事实不符或无法验证，已降低以下事实信任分：\n"
             + "\n".join(down_lines)
         )
 
