@@ -1289,6 +1289,10 @@ def _apply_fact_check_feedback(agent, corrections: list[dict]) -> None:
         return
 
     failed = [c for c in corrections if not c.get("ok", True)]
+    if not failed:
+        return
+
+    feedback_lines = []
     for correction in failed:
         entity = correction.get("entity", "")
         if not entity or len(entity) < 2:
@@ -1307,8 +1311,18 @@ def _apply_fact_check_feedback(agent, corrections: list[dict]) -> None:
                         "fact_feedback",
                         {"action": "unhelpful", "fact_id": fact_id},
                     )
+                    content_preview = match.get("content", "")[:80]
+                    feedback_lines.append(
+                        f"  · [{entity}] fact#{fact_id} trust ↓ ({content_preview})"
+                    )
         except Exception:
             pass
+
+    if feedback_lines:
+        agent._safe_print(
+            "\n📉 [fact-check feedback] 已自动降低以下事实信任分：\n"
+            + "\n".join(feedback_lines)
+        )
 
 
 def _run_auto_retrieval(agent, user_text: str) -> None:
@@ -7560,21 +7574,39 @@ def run_conversation(
     if final_response and not final_response.startswith("I apologize"):
         corrections = _run_fact_check(final_response)
         if corrections:
-            # Dual-classification display: verified-false vs unverifiable
-            _fc_false = [c for c in corrections if c.get("entity") != "?"]
+            # Three-way classification — nothing is silent
+            _fc_verified = [c for c in corrections if c.get("ok", False) and c.get("entity") != "?"]
+            _fc_false = [c for c in corrections if not c.get("ok", True) and c.get("entity") != "?"]
             _fc_unknown = [c for c in corrections if c.get("entity") == "?"]
             lines = []
+
+            if _fc_verified:
+                lines.append("✅ [fact-check] 以下断言验证通过：")
+                for c in _fc_verified:
+                    lines.append(f"  · {c['entity']}: {c.get('claim', '')[:120]}")
+
             if _fc_false:
                 lines.append("⚠️  [fact-check] 以下断言与实际情况不符：")
                 for c in _fc_false:
                     lines.append(f"  · {c['entity']}: 声称的与实测不符 → {c['actual']}")
+
             if _fc_unknown:
-                lines.append("⚠️  [fact-check] 以下断言无法自动验证，请确认：")
+                lines.append("⚠️  [fact-check] 以下断言无法自动验证，已标记待查：")
                 for c in _fc_unknown:
                     lines.append(f"  · {c['claim']}")
+                # Inject into final_response so next-turn agent can investigate
+                unknown_claims = "\n".join(f"  - {c['claim']}" for c in _fc_unknown)
+                final_response += (
+                    f"\n\n[fact-check nudge] 以下断言未能自动验证，"
+                    f"请在下一轮对话中主动查询核实：\n{unknown_claims}"
+                )
+
             if lines:
                 agent._safe_print("\n" + "\n".join(lines))
             _apply_fact_check_feedback(agent, corrections)
+        else:
+            # All claims verified or no claims detected — never silent
+            agent._safe_print("✅ [fact-check] 未检测到问题断言")
 
     return finalize_turn(
         agent,
