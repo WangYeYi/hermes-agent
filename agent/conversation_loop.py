@@ -1467,50 +1467,62 @@ def _format_fact_check_nudge(corrections: list[dict]) -> str:
 
 
 def _apply_fact_check_feedback(agent, corrections: list[dict]) -> None:
-    """Auto-apply fact_feedback(unhelpful) when fact-check detects false claims.
+    """Auto-apply fact_feedback based on fact-check results.
 
-    Searches holographic memory for facts matching each failed correction's
-    entity and lowers their trust score. This makes fact_feedback part of the
-    automated pipeline instead of relying on the agent model to invoke it.
+    - verified (ok=True)  → fact_feedback(helpful) — raise trust
+    - false (ok=False)    → fact_feedback(unhelpful) — lower trust
+    - unknown (entity=?") → skip (nothing to anchor on)
+
+    Both directions produce visible output — never silent.
     """
     memory_manager = getattr(agent, "_memory_manager", None)
     if not memory_manager:
         return
 
-    failed = [c for c in corrections if not c.get("ok", True)]
-    if not failed:
-        return
+    verified = [c for c in corrections if c.get("ok", False) and c.get("entity") != "?"]
+    failed = [c for c in corrections if not c.get("ok", True) and c.get("entity") != "?"]
 
-    feedback_lines = []
-    for correction in failed:
-        entity = correction.get("entity", "")
-        if not entity or len(entity) < 2:
-            continue
-        try:
-            result_json = memory_manager.handle_tool_call(
-                "fact_store",
-                {"action": "search", "query": entity, "limit": 3, "min_trust": 0.3},
-            )
-            result = json.loads(result_json)
-            matches = result.get("results", [])
-            for match in matches:
-                fact_id = match.get("fact_id")
-                if fact_id:
-                    memory_manager.handle_tool_call(
-                        "fact_feedback",
-                        {"action": "unhelpful", "fact_id": fact_id},
-                    )
-                    content_preview = match.get("content", "")[:80]
-                    feedback_lines.append(
-                        f"  · [{entity}] fact#{fact_id} trust ↓ ({content_preview})"
-                    )
-        except Exception:
-            pass
+    up_lines = []
+    down_lines = []
 
-    if feedback_lines:
+    def _apply(entity, items, action, collector):
+        for correction in items:
+            ent = correction.get("entity", "")
+            if not ent or len(ent) < 2:
+                continue
+            try:
+                result_json = memory_manager.handle_tool_call(
+                    "fact_store",
+                    {"action": "search", "query": ent, "limit": 3, "min_trust": 0.3},
+                )
+                result = json.loads(result_json)
+                matches = result.get("results", [])
+                for match in matches:
+                    fact_id = match.get("fact_id")
+                    if fact_id:
+                        memory_manager.handle_tool_call(
+                            "fact_feedback",
+                            {"action": action, "fact_id": fact_id},
+                        )
+                        content_preview = match.get("content", "")[:80]
+                        collector.append(
+                            f"  · [{ent}] fact#{fact_id} ({content_preview})"
+                        )
+            except Exception:
+                pass
+
+    _apply("verified", verified, "helpful", up_lines)
+    _apply("failed", failed, "unhelpful", down_lines)
+
+    if up_lines:
         agent._safe_print(
-            "\n📉 [fact-check feedback] 已自动降低以下事实信任分：\n"
-            + "\n".join(feedback_lines)
+            "\n📈 [fact-check feedback] 验证通过，已提升以下事实信任分：\n"
+            + "\n".join(up_lines)
+        )
+    if down_lines:
+        agent._safe_print(
+            "\n📉 [fact-check feedback] 与事实不符，已降低以下事实信任分：\n"
+            + "\n".join(down_lines)
         )
 
 
