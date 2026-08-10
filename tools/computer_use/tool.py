@@ -588,6 +588,19 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         return json.dumps({"error": f"{action} failed: {e}"})
 
 
+def _fire_cua_approval_hook(hook_name: str, action: str = "", delivery_mode: str = "") -> None:
+    """Fire approval hooks for computer_use — mirrors _fire_approval_hook in approval.py.
+
+    Lazy-imports to avoid circular dependency at module load time.
+    Called before and after _approval_callback in _request_approval().
+    """
+    try:
+        from tools.approval import _fire_approval_hook
+        _fire_approval_hook(hook_name, action=action, delivery_mode=delivery_mode, tool="computer_use")
+    except Exception:
+        pass
+
+
 def _request_approval(action: str, args: Dict[str, Any],
                       session_id: str = "") -> Optional[str]:
     """Return None if approved, or a JSON error string if denied.
@@ -609,6 +622,7 @@ def _request_approval(action: str, args: Dict[str, Any],
         if scope_key in _always_allow.get(session_id, set()):
             return None
     cb = _approval_callback
+    _fire_cua_approval_hook("pre_approval_request", action=action, delivery_mode=args.get("delivery_mode", ""))
     if cb is None:
         # No CLI approval wired — default allow. Gateway approval is handled
         # one layer out via the normal tool-approval infra.
@@ -616,6 +630,8 @@ def _request_approval(action: str, args: Dict[str, Any],
     summary = _summarize_action(action, args)
     try:
         verdict = cb(action, args, summary)
+        _fire_cua_approval_hook("post_approval_decision", action=action,
+                                delivery_mode=args.get("delivery_mode", ""))
     except Exception as e:
         logger.warning("approval callback failed: %s", e)
         verdict = "deny"
