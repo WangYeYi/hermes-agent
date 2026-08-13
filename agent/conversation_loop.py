@@ -1418,107 +1418,256 @@ def _notify_context_engine_turn_complete(
             exc_info=True,
         )
 
-def _run_fact_check(final_response: str, timeout: int = 15) -> list[dict]:
-    """Run verify_factual_claims as subprocess hook after response generation.
+# ═══════════════════════════════════════════════════════════════
+# Output Guard helpers — 多问题覆盖校验
+# ═══════════════════════════════════════════════════════════════
 
-    Pipeline: MiniLM gate → LLM entity extraction → dispatch verifiers.
-    Returns list of correction dicts (entity, claim, actual, ok).
-    Empty list = all claims verified or no claims detected.
-    """
-    import subprocess
-    import sys as _sys
+def _flatten_user_text(user_message: Any) -> str:
+    """从 user_message 提取纯文本内容"""
+    if isinstance(user_message, str):
+        return user_message
+    if isinstance(user_message, list):
+        parts = []
+        for part in user_message:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(part.get("text", ""))
+        return " ".join(parts)
+    return str(user_message) if user_message else ""
 
-    script = os.path.expanduser("~/.hermes/scripts/verify_factual_claims.py")
-    if not os.path.exists(script):
-        return []
-
-    try:
-        proc = subprocess.run(
-            [_sys.executable, script],
-            input=final_response,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            return json.loads(proc.stdout)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
-        pass
-    return []
-
-
-def _format_fact_check_nudge(corrections: list[dict]) -> str:
-    """Format fact-check corrections as a nudge appended to final_response."""
-    failed = [c for c in corrections if not c.get("ok", True)]
-    if not failed:
-        return ""
-    lines = []
-    for c in failed[:5]:
-        entity = c.get("entity", "?")
-        claim = c.get("claim", "")[:120]
-        actual = c.get("actual", "")[:200]
-        lines.append(f"  - {entity}: 「{claim}」→ {actual}")
-    if not lines:
-        return ""
-    return (
-        "\n\n[fact-check] 以下陈述可能需要核实:\n"
-        + "\n".join(lines)
+def _split_user_items(text: str) -> list[str]:
+    """按中文标点/转折词拆分用户消息为独立条目"""
+    # 显式编号: 1. ... 2. ...
+    numbered = re.findall(
+        r'(?:^|\n)\s*'
+        r'(?:[(（]?\d+[)）]|问题\d+|Q\d+|第\d+[条个点])'
+        r'[\s.、:：]+\s*(.+?)(?=\n\s*(?:[(（]?\d+[)）]|问题\d+|Q\d+|第\d+[条个点])|\Z)',
+        text, re.DOTALL
     )
+    if len(numbered) >= 2:
+        return [t.strip() for t in numbered]
+
+    # 按句子分割
+    segments = re.split(r'(?<=[。！？])\s*|\n+', text)
+    segments = [s.strip().rstrip('。！？，,') for s in segments if len(s.strip().rstrip('。！？，,')) >= 3]
+    if len(segments) < 2:
+        sub = re.split(r'(?:还有|另外|以及|另外问|顺便|同时|此外|再加上|最后|然后)', text)
+        sub = [s.strip().rstrip('，,') for s in sub if len(s.strip()) > 3]
+        return sub if len(sub) >= 2 else [text.strip()]
+
+    result = []
+    for seg in segments:
+        sub = re.split(r'(?:还有|另外|以及|另外问|顺便问|同时|此外|再加上)', seg)
+        for s in sub:
+            s = s.strip()
+            if len(s) >= 3:
+                result.append(s)
+    return result if len(result) >= 2 else [text.strip()]
+
+# ── Output Guard JSONL 日志 ───────────────────────────────────
+import datetime
+
+_GUARD_LOG_PATH = os.path.expanduser("~/.hermes/logs/output-guard.jsonl")
+_GUARD_LOG_MAX_AGE = 30 * 86400  # 30 天
 
 
-def _apply_fact_check_feedback(agent, corrections: list[dict]) -> None:
-    """Auto-apply fact_feedback(unhelpful) when fact-check detects false claims.
-
-    Searches holographic memory for facts matching each failed correction's
-    entity and lowers their trust score. This makes fact_feedback part of the
-    automated pipeline instead of relying on the agent model to invoke it.
-    """
-    memory_manager = getattr(agent, "_memory_manager", None)
-    if not memory_manager:
-        return
-
-    failed = [c for c in corrections if not c.get("ok", True)]
-    for correction in failed:
-        entity = correction.get("entity", "")
-        if not entity or len(entity) < 2:
-            continue
-        try:
-            result_json = memory_manager.handle_tool_call(
-                "fact_store",
-                {"action": "search", "query": entity, "limit": 3, "min_trust": 0.3},
-            )
-            result = json.loads(result_json)
-            matches = result.get("results", [])
-            for match in matches:
-                fact_id = match.get("fact_id")
-                if fact_id:
-                    memory_manager.handle_tool_call(
-                        "fact_feedback",
-                        {"action": "unhelpful", "fact_id": fact_id},
-                    )
-        except Exception:
-            pass
-
-
-def _run_auto_retrieval(agent, user_text: str) -> None:
-    """Auto-search holographic memory to bump retrieval_count for topic-relevant facts.
-
-    Runs after every turn, independent of agent tool calls.
-    Frequently-discussed topics get higher retrieval priority over time.
-    """
-    memory_manager = getattr(agent, "_memory_manager", None)
-    if not memory_manager:
-        return
-    if not user_text or len(user_text) < 10:
-        return
+def _guard_write_log(entry: dict) -> None:
+    """追加一条覆盖检查日志。自动清理 30 天前的旧记录。"""
     try:
-        memory_manager.handle_tool_call(
-            "fact_store",
-            {"action": "search", "query": user_text[:500], "limit": 10, "min_trust": 0.3},
+        os.makedirs(os.path.dirname(_GUARD_LOG_PATH), exist_ok=True)
+        now = time.time()
+        with open(_GUARD_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        # 低频清理：每小时最多一次
+        if os.path.getmtime(_GUARD_LOG_PATH) < now - 3600:
+            cutoff = now - _GUARD_LOG_MAX_AGE
+            try:
+                tmp = _GUARD_LOG_PATH + ".tmp"
+                with open(_GUARD_LOG_PATH) as fin, open(tmp, "w") as fout:
+                    for line in fin:
+                        try:
+                            e = json.loads(line)
+                            ts = e.get("ts", "")
+                            if ts and ts >= time.strftime(
+                                "%Y-%m-%dT%H:%M:%S", time.gmtime(cutoff)
+                            ):
+                                fout.write(line)
+                        except (json.JSONDecodeError, KeyError):
+                            fout.write(line)
+                os.replace(tmp, _GUARD_LOG_PATH)
+            except Exception:
+                pass
+    except Exception:
+        pass  # 日志失败不阻塞主流程
+
+
+def _llm_coverage_check(
+    agent, items: list[str], reply: str, uncertain: list[int]
+) -> list[int]:
+    """L3: 对 embedding 不确定的条目，调用 LLM 做最终判定。
+    
+    复用 agent.client 零认证开销。返回仍遗漏的条目索引列表。
+    """
+    if not uncertain or not hasattr(agent, "client") or agent.client is None:
+        return uncertain  # 无客户端时保守：全部判为遗漏
+
+    items_text = "\n".join(f"  [{i}] {items[i-1]}" for i in uncertain)
+    prompt = (
+        f"你是输出覆盖校验器。判断以下{len(uncertain)}个条目是否被AI回答覆盖。\n"
+        f"只输出JSON数组，格式：[{{\"item\": 序号, \"covered\": true/false, \"reason\": \"理由\"}}]\n\n"
+        f"条目列表：\n{items_text}\n\nAI回答：\n{reply}"
+    )
+    try:
+        resp = agent.client.chat.completions.create(
+            model=getattr(agent, "model", "deepseek-chat"),
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=300,
         )
+        content = resp.choices[0].message.content or ""
+        match = re.search(r"\[.*\]", content, re.DOTALL)
+        if match:
+            judgments = json.loads(match.group())
+            return [j["item"] for j in judgments if not j["covered"]]
     except Exception:
         pass
+    return uncertain  # 失败时保守：全部判为遗漏
 
+
+def _run_output_guard(agent, final_response: str, original_user_message: Any) -> list[int]:
+    """运行覆盖检查（L1 字级规则 + L2 Embedding + L3 LLM fallback + JSONL 日志）。
+
+    三层降级：
+      L1: 字级规则引擎 — 英文专有名词精确匹配 + 短中文条目字级匹配（0 token, ~1ms）
+      L2: Embedding 语义判断 — HTTP MiniLM 常驻服务（0 token, ~50ms）
+      L3: LLM 灰区复核 — 复用 agent.client（~300 token, ~1s）
+
+    返回遗漏的条目索引列表（1-based），无遗漏返回 []。
+    每次检查写入 JSONL 日志到 ~/.hermes/logs/output-guard.jsonl。
+    """
+    if not final_response or final_response.startswith("I apologize"):
+        return []
+    user_text = _flatten_user_text(original_user_message)
+    if not user_text:
+        return []
+    items = _split_user_items(user_text)
+    if len(items) < 2:
+        return []
+
+    log_entry = {
+        "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
+        "session": getattr(agent, "_session_id", "unknown"),
+        "models": ["MiniLM-L12-v2"],
+        "threshold": 0.12,
+        "items": [{"idx": i + 1, "text": t[:200]} for i, t in enumerate(items)],
+        "reply_preview": final_response[:200],
+        "l1": {"sure_pass": [], "sure_miss": []},
+        "l2": {"source": "http-minilm", "detail": {}, "error": False},
+        "l3_fallback": False,
+        "missed": [],
+        "verdict": "PASS",
+    }
+
+    # ── L1: 字级规则引擎（0 token, ~1ms）──
+    sure_covered = set()
+    sure_missed = set()
+    for i, item in enumerate(items):
+        idx = i + 1
+        eng = re.findall(r"[a-zA-Z][a-zA-Z0-9._/-]{2,}", item)
+        if eng:
+            if all(e.lower() in final_response.lower() for e in eng):
+                sure_covered.add(idx)
+            elif not any(e.lower() in final_response.lower() for e in eng):
+                # 有专有名词但全部缺失 → 确定遗漏
+                sure_missed.add(idx)
+                continue
+        # 短中文条目 (≤8个中文字): 字级匹配
+        chars = re.findall(r"[\u4e00-\u9fff]", item)
+        if len(chars) <= 8 and chars:
+            hit = sum(1 for c in chars if c in final_response)
+            ratio = hit / len(chars)
+            if ratio >= 0.6:
+                sure_covered.add(idx)
+            elif len(chars) <= 4 and hit == 0:
+                sure_missed.add(idx)
+
+    log_entry["l1"]["sure_pass"] = sorted(sure_covered)
+    log_entry["l1"]["sure_miss"] = sorted(sure_missed)
+
+    # 确定遗漏的不送 embedding
+    remaining = [
+        i for i in range(1, len(items) + 1)
+        if i not in sure_covered and i not in sure_missed
+    ]
+    # L1 已确定遗漏直接计入
+    missed = sorted(sure_missed)
+
+    if not remaining:
+        if missed:
+            log_entry["missed"] = missed
+            log_entry["verdict"] = "MISSING"
+        _guard_write_log(log_entry)
+        return missed
+
+    # ── L2: Embedding 语义判断（HTTP 常驻服务）──
+    l2_results = []
+    l2_error = False
+    try:
+        import urllib.request as _urllib
+        remaining_items = [items[i - 1] for i in remaining]
+        payload = json.dumps(
+            {"items": remaining_items, "reply": final_response, "threshold": 0.12}
+        ).encode()
+        req = _urllib.Request(
+            "http://127.0.0.1:5199/check",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with _urllib.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        l2_results = data.get("results", [])
+        log_entry["l2"]["detail"] = {
+            "results": [
+                {"idx": r["index"], "sim": round(r.get("similarity", 0), 4),
+                 "covered": r.get("covered", False)}
+                for r in l2_results
+            ]
+        }
+    except Exception:
+        l2_error = True
+        log_entry["l2"]["error"] = True
+
+    if l2_error:
+        # HTTP 不可用：所有 remaining 送 L3
+        uncertain_for_l3 = list(remaining)
+    else:
+        # L2 已覆盖的移除，未覆盖的送 L3
+        l2_missed = [
+            remaining[r["index"] - 1]
+            for r in l2_results
+            if not r.get("covered")
+        ]
+        uncertain_for_l3 = list(dict.fromkeys(l2_missed + missed))  # 合并去重
+
+    if not uncertain_for_l3:
+        _guard_write_log(log_entry)
+        return []
+
+    # ── L3: LLM 灰区复核 ──
+    l3_missed = _llm_coverage_check(agent, items, final_response, uncertain_for_l3)
+    log_entry["l3_fallback"] = True
+    final_missed = sorted(set(l3_missed))
+    if final_missed:
+        log_entry["missed"] = final_missed
+        log_entry["verdict"] = "MISSING"
+    _guard_write_log(log_entry)
+    return final_missed
+
+def _format_guard_nudge(missed_indices: list[int]) -> str:
+    """格式化遗漏提醒"""
+    if not missed_indices:
+        return ""
+    items_str = "、".join(f"第{i}条" for i in missed_indices)
+    return f"\n\n> ⚠️ [输出覆盖检查] 检测到上述回答遗漏了 {items_str}，请补充。" if missed_indices else ""
 
 def run_conversation(
     agent,
@@ -7946,36 +8095,6 @@ def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
-    from agent.turn_finalizer import finalize_turn
-
-    # ── Factual claim verification: MiniLM claim detection + gh/shell cross-check ──
-    if final_response and not final_response.startswith("I apologize"):
-        try:
-            import subprocess as _fc_sp
-            _fc_result = _fc_sp.run(
-                ["python3", os.path.expanduser("~/.hermes/scripts/verify_factual_claims.py")],
-                input=final_response, capture_output=True, timeout=15, text=True
-            )
-            if _fc_result.returncode == 0:
-                _fc_claims = json.loads(_fc_result.stdout)
-                if _fc_claims:
-                    # Separate verified false claims from unverifiable ones
-                    _fc_false = [c for c in _fc_claims if c.get("entity") != "?"]
-                    _fc_unknown = [c for c in _fc_claims if c.get("entity") == "?"]
-                    lines = []
-                    if _fc_false:
-                        lines.append("⚠️  [fact-check] 以下断言与实际情况不符：")
-                        for c in _fc_false:
-                            lines.append(f"  · {c['entity']}: 声称的与实测不符 → {c['actual']}")
-                    if _fc_unknown:
-                        lines.append("⚠️  [fact-check] 以下断言无法自动验证，请确认：")
-                        for c in _fc_unknown:
-                            lines.append(f"  · {c['claim']}")
-                    if lines:
-                        agent._safe_print("\n" + "\n".join(lines))
-        except Exception:
-            pass  # non-critical
-
     return finalize_turn(
         agent,
         final_response=final_response,
