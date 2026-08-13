@@ -4327,38 +4327,48 @@ def check_all_command_guards(command: str, env_type: str,
 # caught.  ctypes is listed as a whole-module gate: any import of ctypes
 # triggers the guard because ctypes.CDLL provides unrestricted syscall
 # access that bypasses every Python-level check.
-_EXEC_CODE_DANGEROUS_CALLS = frozenset({
-    # File / directory deletion
-    ("os", "remove"),
-    ("os", "unlink"),
-    ("shutil", "rmtree"),
-    # File / directory write (config write bypass, #49578)
-    ("shutil", "copy"),
-    ("shutil", "copy2"),
-    ("shutil", "move"),
-    ("shutil", "copytree"),
-    ("os", "rename"),
-    ("os", "replace"),
-    # Arbitrary command execution (bypasses terminal() DANGEROUS_PATTERNS)
-    ("os", "system"),
-    ("os", "popen"),
-    ("subprocess", "run"),
-    ("subprocess", "call"),
-    ("subprocess", "Popen"),
-    ("subprocess", "check_output"),
-    ("subprocess", "check_call"),
-})
+# (module, func) → reason key。调用这些 API 会绕过 terminal() 的
+# DANGEROUS_PATTERNS 审批。reason key 见 _EXEC_CODE_DANGER_DETAILS。
+_EXEC_CODE_DANGEROUS_CALLS = {
+    # 文件/目录删除
+    ("os", "remove"): "file-delete",
+    ("os", "unlink"): "file-delete",
+    ("shutil", "rmtree"): "file-delete",
+    # 文件移动/复制/重命名（config write bypass, #49578）
+    ("shutil", "copy"): "file-mutate",
+    ("shutil", "copy2"): "file-mutate",
+    ("shutil", "move"): "file-mutate",
+    ("shutil", "copytree"): "file-mutate",
+    ("os", "rename"): "file-mutate",
+    ("os", "replace"): "file-mutate",
+    # 任意命令执行（绕过 terminal() DANGEROUS_PATTERNS）
+    ("os", "system"): "command-exec",
+    ("os", "popen"): "command-exec",
+    ("subprocess", "run"): "command-exec",
+    ("subprocess", "call"): "command-exec",
+    ("subprocess", "Popen"): "command-exec",
+    ("subprocess", "check_output"): "command-exec",
+    ("subprocess", "check_call"): "command-exec",
+}
 
-# Modules whose mere import triggers the guard (even without calling
-# specific functions).  ctypes qualifies — ``ctypes.CDLL(None).unlink(...)``
-# requires no os.remove to bypass every check.
+# 模块的整体导入即触发 guard（即使不调用具体函数）。ctypes 符合——
+# ``ctypes.CDLL(None).unlink(...)`` 无需 os.remove 即可绕过所有检查。
 _EXEC_CODE_SUSPICIOUS_IMPORTS = frozenset({"ctypes"})
 
-# Builtin functions that can write or destroy files without going through
-# imported-module APIs.  ``open(path, "w")`` writes arbitrary local files
-# and its mode argument cannot be statically determined; any call to
-# ``open`` inside execute_code therefore triggers the guard.
-_EXEC_CODE_DANGEROUS_BUILTINS = frozenset({"open"})
+# reason key → (用户可读的中文原因, 建议改用方式)。用于 execute_code
+# 拦截提示区分具体原因，避免 Agent 被拦后无从判断该换什么工具。
+_EXEC_CODE_DANGER_DETAILS = {
+    "open-write": ("文件写入（open 的 w/a/x 或 + 模式）",
+                   "改用 write_file 或 patch 工具"),
+    "file-delete": ("文件/目录删除（os.remove / shutil.rmtree 等）",
+                    "先确认目标路径，或改用 terminal 走正常审批"),
+    "file-mutate": ("文件移动/复制/重命名（shutil.copy / os.rename 等）",
+                    "先确认目标路径"),
+    "command-exec": ("任意命令执行（subprocess / os.system 等）",
+                     "改用 terminal 工具，走正常命令审批"),
+    "ctypes-import": ("ctypes 模块导入（可绕过所有 Python 级检查）",
+                      "确认确实需要 syscall 级访问"),
+}
 
 
 def _log_blocked_exec_code(code: str, reason: str) -> None:
@@ -4373,10 +4383,31 @@ def _log_blocked_exec_code(code: str, reason: str) -> None:
     )
 
 
-def _execute_code_has_dangerous_ops(code: str) -> bool:
-    """Return True if *code* contains operations that bypass terminal()
-    / DANGEROUS_PATTERNS approval: dangerous module.func calls,
-    suspicious imports (ctypes), or their aliased equivalents.
+def _open_mode_is_write(call_node: ast.Call) -> bool:
+    """判断 open(...) 调用的 mode 参数是否为写模式。
+
+    open(file, mode='r', ...) — mode 是第二个位置参数或 keyword 参数。
+    mode 缺省或明确只读（r/rb/rt）→ False；含写标志（w/a/x/+）→ True；
+    mode 是变量/表达式无法静态判定 → True（保守拦截）。
+    """
+    mode_arg = None
+    if len(call_node.args) >= 2:
+        mode_arg = call_node.args[1]  # 第二个位置参数
+    else:
+        for kw in call_node.keywords:
+            if kw.arg == "mode":
+                mode_arg = kw.value
+                break
+    if mode_arg is None:
+        return False  # 无 mode → 默认 'r'，只读
+    if isinstance(mode_arg, ast.Constant) and isinstance(mode_arg.value, str):
+        return any(c in mode_arg.value for c in "wax+")
+    return True  # 变量/表达式，无法静态判定 → 保守拦截
+
+
+def _execute_code_has_dangerous_ops(code: str):
+    """返回 execute_code 脚本中首个危险操作的 reason key（见
+    ``_EXEC_CODE_DANGER_DETAILS``），无危险操作返回 None。
 
     Two-pass scan:
     1. Collect all imports → ``{local_name: (module, attr)}`` mapping
@@ -4388,7 +4419,7 @@ def _execute_code_has_dangerous_ops(code: str) -> bool:
     try:
         tree = ast.parse(code)
     except SyntaxError:
-        return False
+        return None
 
     # ── Pass 1: collect imports ──────────────────────────────
     # local_name → (module, attr_or_None_if_wildcard)
@@ -4406,10 +4437,10 @@ def _execute_code_has_dangerous_ops(code: str) -> bool:
                     continue  # star import — too broad, skip
                 imports[name] = (module, alias.name)
 
-    # ── Check for suspicious whole-module imports ────────────
+    # ── 可疑模块整体导入（ctypes）────────────────────────────
     for _local_name, (_module, _attr) in imports.items():
         if _module in _EXEC_CODE_SUSPICIOUS_IMPORTS:
-            return True
+            return "ctypes-import"
 
     # ── Pass 2: walk call nodes ──────────────────────────────
     for node in ast.walk(tree):
@@ -4421,18 +4452,19 @@ def _execute_code_has_dangerous_ops(code: str) -> bool:
         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
             key = (func.value.id, func.attr)
             if key in _EXEC_CODE_DANGEROUS_CALLS:
-                return True
+                return _EXEC_CODE_DANGEROUS_CALLS[key]
 
         # Aliased name:  from os import remove  →  remove(x)
         if isinstance(func, ast.Name):
-            # Builtin danger: open() etc. — not an import, statically
-            # undetectable intent (mode arg).  Any call triggers guard.
-            if func.id in _EXEC_CODE_DANGEROUS_BUILTINS:
-                return True
+            # open() — 区分读写模式（只读放行，写拦截）
+            if func.id == "open":
+                if _open_mode_is_write(node):
+                    return "open-write"
+                continue  # 只读 open，放行
             if func.id in imports:
                 resolved = imports[func.id]
                 if resolved in _EXEC_CODE_DANGEROUS_CALLS:
-                    return True
+                    return _EXEC_CODE_DANGEROUS_CALLS[resolved]
 
         # Aliased attribute:  import subprocess as sp  →  sp.run(x)
         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
@@ -4444,9 +4476,18 @@ def _execute_code_has_dangerous_ops(code: str) -> bool:
                 else:
                     key = (_m, _a)
                 if key in _EXEC_CODE_DANGEROUS_CALLS:
-                    return True
+                    return _EXEC_CODE_DANGEROUS_CALLS[key]
 
-    return False
+    return None
+
+
+def _exec_code_reason_text(reason: str) -> str:
+    """把 reason key 转成用户可读的拦截说明（含建议改用方式）。"""
+    detail = _EXEC_CODE_DANGER_DETAILS.get(reason)
+    if detail is None:
+        return f"危险操作（{reason}）"
+    why, remedy = detail
+    return f"{why}；建议：{remedy}"
 
 
 def check_execute_code_guard(code: str, env_type: str,
@@ -4524,12 +4565,13 @@ def check_execute_code_guard(code: str, env_type: str,
     #   terminal() DANGEROUS_PATTERNS entirely (#49578).  Pure-data scripts
     #   (pandas, json, report generation) still pass through without
     #   prompting.
+    danger_reason = None  # gateway/ask 路径不扫描，保持 None
     if not is_gateway and not is_ask:
-        if not _execute_code_has_dangerous_ops(code):
+        danger_reason = _execute_code_has_dangerous_ops(code)
+        if danger_reason is None:
             return {"approved": True, "message": None}
-        # Dangerous ops detected — fall through to approval prompt below
-        # so the user can make an explicit decision.
-        _log_blocked_exec_code(code, "AST-dangerous-ops-CLI-fallthrough")
+        # 检测到危险操作 → 落到下方审批弹窗，让用户显式决策。
+        _log_blocked_exec_code(code, f"AST-dangerous-ops-CLI-fallthrough:{danger_reason}")
 
     session_key = get_current_session_key()
     # Built only now (past the early-return gates) so the common non-approval
@@ -4614,6 +4656,9 @@ def check_execute_code_guard(code: str, env_type: str,
         if smart_denied_for_owner:
             pending_data.update(smart_denied=True, allow_permanent=False)
         submit_pending(session_key, pending_data)
+        danger_note = ""
+        if danger_reason:
+            danger_note = f"\n\n检测到危险操作：{_exec_code_reason_text(danger_reason)}"
         result = {
             "approved": False,
             "pattern_key": pattern_key,
@@ -4623,7 +4668,7 @@ def check_execute_code_guard(code: str, env_type: str,
             "description": display_description,
             "message": (
                 f"BLOCKED: {display_description}. Asking the user for approval.\n\n"
-                f"**Code:**\n```python\n{display_code}\n```"
+                f"**Code:**\n```python\n{display_code}\n```{danger_note}"
             ),
         }
         if smart_denied_for_owner:
