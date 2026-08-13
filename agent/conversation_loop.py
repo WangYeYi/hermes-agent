@@ -1520,38 +1520,6 @@ def _run_auto_retrieval(agent, user_text: str) -> None:
         pass
 
 
-def _run_claim_verifier(final_response: str) -> dict:
-    """Run agent_claim_verifier.py as subprocess hook.
-
-    Extracts verifiable assertions from the response (PR #, commit hash,
-    file paths, issue numbers) and verifies each against external sources
-    (GitHub API, git, filesystem). Returns structured results with
-    pass/fail/unknown verdicts. Always produces visible output.
-    """
-    import subprocess
-    import sys as _sys
-
-    script = os.path.expanduser("~/.hermes/scripts/agent_claim_verifier.py")
-    if not os.path.exists(script):
-        return {"summary": {"total": 0, "passed": 0, "failed": 0, "unknown": 0},
-                "formatted": ""}
-
-    try:
-        proc = subprocess.run(
-            [_sys.executable, script],
-            input=final_response,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            return json.loads(proc.stdout)
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
-        pass
-    return {"summary": {"total": 0, "passed": 0, "failed": 0, "unknown": 0},
-            "formatted": ""}
-
-
 def run_conversation(
     agent,
     user_message: Any,
