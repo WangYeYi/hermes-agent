@@ -1399,19 +1399,27 @@ def _home_prefix_fold_regex(path: str):
     patterns (``~/.ssh/authorized_keys``) still match. The trailing tail is
     required (``+``), so a bare home with no path under it is not folded.
 
-    Returns ``None`` for an unset or degenerate path — one with fewer than two
-    components below the root — so a stray HOME / HERMES_HOME such as ``/``,
-    ``C:\\`` or ``""`` cannot rewrite unrelated filesystem prefixes. Cached
-    because the resolved home is stable across calls on this hot path.
+    Returns ``None`` for an unset or degenerate path — an empty root (``/``)
+    or a bare Windows drive root (``C:\\``) — so a stray HOME / HERMES_HOME
+    such as ``/``, ``C:\\`` or ``""`` cannot rewrite unrelated filesystem
+    prefixes. A single non-drive segment is a valid single-segment POSIX home
+    (``/root`` when Hermes runs as root) and folds too; the old
+    ``len(components) < 2`` guard rejected it, leaving absolute-path writes to
+    ``/root/.ssh/authorized_keys`` un-gated (issue #84639). Cached because the
+    resolved home is stable across calls on this hot path.
     """
     if not path:
         return None
     components = [c for c in re.split(r"[/\\]+", path) if c]
-    # Require at least two non-empty components below the root. For POSIX this
-    # mirrors the historical ``count("/") >= 2`` guard (``/home/alice`` folds,
-    # ``/home`` does not); for Windows it rejects a bare drive root (``C:\\``)
-    # while accepting a real home (``C:\\Users\\alice``).
-    if len(components) < 2:
+    # Reject a degenerate root only: no components (``/``) or a bare Windows
+    # drive root (``C:\\``). A single non-drive segment is a valid
+    # single-segment POSIX home (``/root``) and MUST fold so absolute-path
+    # writes to it hit the same `~/.ssh`-anchored patterns as tilde/$HOME
+    # forms (issue #84639). ``/home/alice`` (2) and ``C:\\Users\\alice`` (3)
+    # are unchanged.
+    if not components:
+        return None
+    if len(components) == 1 and re.match(r"^[A-Za-z]:$", components[0]):
         return None
     body = r"[/\\]+".join(re.escape(c) for c in components)
     # Optional leading root separator (POSIX ``/`` or UNC ``\\``); a Windows
