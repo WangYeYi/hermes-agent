@@ -7474,9 +7474,26 @@ def run_conversation(
                     if _msg.get("role") != "tool":
                         break
                     _content = _msg.get("content", "")
-                    if isinstance(_content, str) and _content.startswith("BLOCKED"):
-                        _user_blocked = True
-                        break
+                    if isinstance(_content, str):
+                        # Plain-text BLOCKED — terminal/file_tools/approval
+                        if _content.startswith("BLOCKED") or _content.startswith("[\"BLOCKED"):
+                            _user_blocked = True
+                            break
+                        # JSON-wrapped BLOCKED — execute_code returns
+                        # {"status":"error","error":"BLOCKED: ..."} when the
+                        # user denies via approval guard.  The plain-text
+                        # startswith check misses this path entirely
+                        # (local patch #65592 review).
+                        if _content.startswith("{"):
+                            try:
+                                parsed = json.loads(_content)
+                                if isinstance(parsed, dict):
+                                    error = parsed.get("error", "")
+                                    if isinstance(error, str) and error.startswith("BLOCKED"):
+                                        _user_blocked = True
+                                        break
+                            except (json.JSONDecodeError, TypeError):
+                                pass
                 if _user_blocked:
                     _turn_exit_reason = "user_blocked"
                     final_response = (
@@ -8327,11 +8344,29 @@ def run_conversation(
                         agent._flush_messages_to_session_db(messages, conversation_history)
                     except Exception:
                         logger.debug("verify-on-stop interim flush failed", exc_info=True)
-                    append_message(messages, {
-                        "role": "user",
-                        "content": _verify_nudge,
-                        "_verification_stop_synthetic": True,
-                    })
+                    # Prepend the nudge to the most recent real user message
+                    # rather than appending a new one after it.  Appending
+                    # makes the nudge the most recent user instruction,
+                    # causing the model to prioritize it over the user's
+                    # actual question — a priority inversion (local patch #68586).
+                    _user_idx = None
+                    for _i in range(len(messages) - 1, -1, -1):
+                        if (
+                            isinstance(messages[_i], dict)
+                            and messages[_i].get("role") == "user"
+                            and not messages[_i].get("_verification_stop_synthetic")
+                        ):
+                            _user_idx = _i
+                            break
+                    if _user_idx is not None:
+                        _orig = messages[_user_idx].get("content", "")
+                        messages[_user_idx]["content"] = f"{_verify_nudge}\n\n{_orig}"
+                    else:
+                        append_message(messages, {
+                            "role": "user",
+                            "content": _verify_nudge,
+                            "_verification_stop_synthetic": True,
+                        })
                     agent._session_messages = messages
                     # Run the verification-stop loop silently — the nudge is an
                     # internal turn that should not add noise to the user's
