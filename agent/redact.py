@@ -65,6 +65,32 @@ _SENSITIVE_BODY_KEYS = frozenset({
     "key",
 })
 
+# 百度系登录态 cookie 名（__cas__st__3 / CPTK_585 / BDUSS / STOKEN 等）。
+# 这些 key 既不含通用 secret 关键词（token/key/password，见 _SENSITIVE_BODY_KEYS
+# 与 _ENV_ASSIGN_RE），值也不带已知 vendor 前缀（sk-/ghp_ 等），所以前缀、
+# ENV、CFG 三路正则都不命中——百度竞价/爱番番的 cookie 值会明文漏进日志、
+# 工具输出和 read_file 内容。这里用「已知敏感 cookie 名」精确匹配补上。
+# 值以分号/空白/`&` 为界（cookie 串与 form 体的分隔符），base64 的 `=` 与
+# urlencode 的 `%` 都保留在值内。匹配名足够特异，误报风险极低。
+_SENSITIVE_COOKIE_NAMES = (
+    r"BDUSS",                 # 百度登录态（等价账号密码，最高敏感）
+    r"STOKEN",                # 百度安全 token
+    r"PTOKEN",                # 百度 passport token
+    r"__cas__st__\d+",        # 百度 CAS session ticket（fengchao/爱番番）
+    r"__cas__id__\d+",        # 百度 CAS id
+    r"__cas__rn__",           # 百度 CAS random number
+    r"CPTK_\d+",              # 百度 passport ticket
+    r"CPID_\d+",              # 百度 passport id
+)
+_COOKIE_ASSIGN_RE = re.compile(
+    rf"(?<![A-Za-z0-9_])({'|'.join(_SENSITIVE_COOKIE_NAMES)})\s*=\s*([^;\s&]+)"
+)
+# 线性 pre-gate：文本不含任何 cookie 名关键词时跳过 _COOKIE_ASSIGN_RE，
+# 避免对普通日志/代码做无谓的正则扫描（与 _CFG_SECRET_WORD_RE 同理）。
+_COOKIE_PRE_GATE_RE = re.compile(
+    r"__cas__|CPTK_|CPID_|BDUSS|STOKEN|PTOKEN"
+)
+
 # Snapshot at import time so runtime env mutations (e.g. LLM-generated
 # `export HERMES_REDACT_SECRETS=false`) cannot disable redaction
 # mid-session.  ON by default — secure default per issue #17691. Users who
@@ -841,6 +867,17 @@ def redact_sensitive_text(
         # original are aligned 1:1 for non-control chars).
         text = _mask_control_split_tokens(text, _prefix_sub)
         text = _PREFIX_RE.sub(lambda m: _prefix_sub(m.group(1)), text)
+
+    # 百度系登录态 cookie（__cas__st__3=…、CPTK_585=…、BDUSS=…）——值不带
+    # vendor 前缀、key 不含 secret 关键词，前缀/ENV/CFG 三路都不命中，历史
+    # 明文漏出。精确匹配已知 cookie 名；file_read 时用不可复用 sentinel
+    # （与前缀一致，见 issue #35519，避免 agent 把截断值写回损坏凭据）。
+    if _COOKIE_PRE_GATE_RE.search(text):
+        _cookie_sub = _mask_token_nonreusable if file_read else _mask_token
+        text = _COOKIE_ASSIGN_RE.sub(
+            lambda m: f"{m.group(1)}={_cookie_sub(m.group(2))}",
+            text,
+        )
 
     # ENV assignments: OPENAI_API_KEY=***  (skip for code files — false positives)
     if not code_file:
