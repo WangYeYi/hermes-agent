@@ -498,9 +498,9 @@ def _is_luhn_valid(num_str: str) -> bool:
 
 
 def _mask_cn_mobile(m: re.Match) -> str:
-    """国内手机号脱敏：保留前 3 后 4（138****5678）。"""
+    """国内手机号脱敏：保留前 3 后 4（138····5678）。"""
     p = m.group(1)
-    return p[:3] + "****" + p[-4:]
+    return p[:3] + "····" + p[-4:]
 
 
 def _mask_cn_idcard(m: re.Match) -> str:
@@ -508,7 +508,7 @@ def _mask_cn_idcard(m: re.Match) -> str:
     idv = m.group(1)
     if not _is_valid_cn_idcard(idv):
         return m.group(0)
-    return idv[:6] + "********" + idv[-4:]
+    return idv[:6] + "········" + idv[-4:]
 
 
 def _mask_email(m: re.Match) -> str:
@@ -524,7 +524,7 @@ def _mask_bankcard(m: re.Match) -> str:
     card = m.group(1)
     if not (_BANKCARD_BIN_RE.match(card[:6]) and _is_luhn_valid(card)):
         return m.group(0)
-    return card[:4] + "*" * (len(card) - 8) + card[-4:]
+    return card[:4] + "·" * (len(card) - 8) + card[-4:]
 
 
 # 百度账号 UID：18 位、81 开头（818882... 是百度竞价/爱番番账号标识）。
@@ -534,9 +534,9 @@ _BAIDU_UID_RE = re.compile(r"(?<!\d)(81\d{16})(?!\d)")
 
 
 def _mask_baidu_uid(m: re.Match) -> str:
-    """百度 UID 脱敏：保留前 2 后 2（81****87）。"""
+    """百度 UID 脱敏：保留前 2 后 2（81····87）。"""
     uid = m.group(1)
-    return uid[:2] + "****" + uid[-2:]
+    return uid[:2] + "····" + uid[-2:]
 
 # URLs containing query strings — matches `scheme://...?...[# or end]`.
 # Used to scan text for URLs whose query params may contain secrets.
@@ -1143,8 +1143,8 @@ def redact_sensitive_text(
         def _redact_phone(m):
             phone = m.group(1)
             if len(phone) <= 8:
-                return phone[:2] + "****" + phone[-2:]
-            return phone[:4] + "****" + phone[-4:]
+                return phone[:2] + "····" + phone[-2:]
+            return phone[:4] + "····" + phone[-4:]
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
     # 有规律的 PII：手机号 / 身份证 / 邮箱 / 银行卡。
