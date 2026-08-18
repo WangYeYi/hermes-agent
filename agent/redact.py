@@ -512,9 +512,11 @@ def _mask_cn_idcard(m: re.Match) -> str:
 
 
 def _mask_email(m: re.Match) -> str:
-    """邮箱脱敏：保留本地部分首字符 + *** + @域名（z***@qq.com）。"""
+    """邮箱脱敏：保留本地部分首尾字符（z…n@qq.com）。"""
     local, _, domain = m.group(1).partition("@")
-    return f"{(local[0] if local else '')}***@{domain}"
+    if len(local) >= 2:
+        return f"{local[0]}…{local[-1]}@{domain}"
+    return f"{local}@{domain}"
 
 
 def _mask_bankcard(m: re.Match) -> str:
@@ -523,6 +525,18 @@ def _mask_bankcard(m: re.Match) -> str:
     if not (_BANKCARD_BIN_RE.match(card[:6]) and _is_luhn_valid(card)):
         return m.group(0)
     return card[:4] + "*" * (len(card) - 8) + card[-4:]
+
+
+# 百度账号 UID：18 位、81 开头（818882... 是百度竞价/爱番番账号标识）。
+# 81 不在任何发卡 BIN 号段，也不可能是身份证地区码（11-65 开头），所以
+# 用 81 前缀做精确识别不会与银行卡/身份证规则冲突。
+_BAIDU_UID_RE = re.compile(r"(?<!\d)(81\d{16})(?!\d)")
+
+
+def _mask_baidu_uid(m: re.Match) -> str:
+    """百度 UID 脱敏：保留前 2 后 2（81****87）。"""
+    uid = m.group(1)
+    return uid[:2] + "****" + uid[-2:]
 
 # URLs containing query strings — matches `scheme://...?...[# or end]`.
 # Used to scan text for URLs whose query params may contain secrets.
@@ -1142,6 +1156,11 @@ def redact_sensitive_text(
         text = _EMAIL_RE.sub(_mask_email, text)
     if _CN_IDCARD_RE.search(text):
         text = _CN_IDCARD_RE.sub(_mask_cn_idcard, text)
+    # 百度 UID 必须在银行卡规则之前：UID 是 81 开头的 18 位数字，会被
+    # _BANKCARD_RE 的 16-19 位捕获，虽然 BIN 白名单会放行，但先遮 UID
+    # 语义更清晰、不依赖白名单的顺序兜底。
+    if _BAIDU_UID_RE.search(text):
+        text = _BAIDU_UID_RE.sub(_mask_baidu_uid, text)
     if _BANKCARD_RE.search(text):
         text = _BANKCARD_RE.sub(_mask_bankcard, text)
 
