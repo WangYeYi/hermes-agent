@@ -542,27 +542,52 @@ _EXEC_CODE_SENSITIVE_PREFIXES = (
 _EXEC_CODE_SENSITIVE_HOME_TREES = (".ssh", ".hermes", ".aws", ".gnupg")
 _EXEC_CODE_SENSITIVE_EXACT = {"/var/run/docker.sock", "/run/docker.sock"}
 
+# 只读/查询方法白名单（2026-08-26 补：#49578 残余面——pandas/numpy 等库
+# 写方法的路径参数绕过 open()/Path() 形状检测）。带敏感路径参数的方法调用
+# 若不在本集合中，一律 hard-block。集合覆盖：纯路径操作（无 IO）、存在性/
+# 元数据查询、目录列举、文件内容读取（read/load/read_* 系列）。
+_EXEC_CODE_READONLY_QUERY_NAMES = frozenset({
+    # --- 纯路径操作（os.path.* / pathlib 属性，无文件 IO）---
+    "join", "basename", "dirname", "split", "splitext", "abspath", "realpath",
+    "normpath", "normcase", "expanduser", "expandvars", "commonpath",
+    "commonprefix", "relpath", "samefile", "sameopenfile", "samestat",
+    "name", "suffix", "suffixes", "stem", "anchor", "parent", "parents",
+    "parts", "as_posix", "as_uri", "cwd", "home",
+    # --- 存在性 / 元数据查询（不读取内容）---
+    "exists", "isfile", "isdir", "islink", "ismount", "lexists",
+    "is_file", "is_dir", "is_symlink", "is_socket", "is_fifo",
+    "is_block_device", "is_char_device", "is_absolute", "is_relative_to",
+    "stat", "lstat", "fstat", "getsize", "getmtime", "getctime", "getatime",
+    "access", "walk", "scandir", "listdir", "glob", "iglob", "rglob",
+    "iterdir", "absolute", "resolve",
+    # --- 文件内容读取（读敏感目标 = #46900 的 secret 读取面，单独管控；
+    #   与 open() 只读放行行为保持一致）---
+    "read", "read_text", "read_bytes", "readlines", "readline",
+    "load", "loads", "loadtxt", "loadmat", "load_npy", "fromfile",
+    "fromstring", "frombuffer", "memmap", "imread", "imdecode", "mmap",
+    "read_csv", "read_json", "read_excel", "read_parquet", "read_pickle",
+    "read_hdf", "read_sql", "read_html", "read_xml", "read_fwf",
+    "read_table", "read_sas", "read_spss", "read_clipboard", "read_feather",
+    "read_orc", "read_stata", "read_gbq", "read_sql_table", "read_sql_query",
+})
+
 _STRING_CONSTANT_EVAL_RE = re.compile(
     r"os\.path\.expanduser\((['\"])(.*?)\1\)", re.DOTALL
 )
 
 
-def _resolve_static_write_target(node: ast.Call, raw_aliases, imports) -> str | None:
-    """Try to resolve an open()/Path() first-arg target to a literal path.
+def _resolve_expr_path(expr, raw_aliases, imports) -> str | None:
+    """Try to resolve *expr* (any AST expression) to a literal path string.
 
     Handles: string literal, ``os.path.expanduser("...")`` with a literal,
     a simple variable alias whose RHS is one of those, and (2026-08-26) a
     function-reference alias ``h = os.path.expanduser; h("...")``.  Returns
     None when the target is not statically resolvable.
     """
-    if not node.args:
-        return None
-    target_expr = node.args[0]
-
-    if isinstance(target_expr, ast.Constant) and isinstance(target_expr.value, str):
-        return target_expr.value
-    if isinstance(target_expr, ast.Name) and target_expr.id in raw_aliases:
-        rhs = raw_aliases[target_expr.id]
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return expr.value
+    if isinstance(expr, ast.Name) and expr.id in raw_aliases:
+        rhs = raw_aliases[expr.id]
         if isinstance(rhs, ast.Constant) and isinstance(rhs.value, str):
             return rhs.value
         # os.path.expanduser("~/.hermes/config.yaml")
@@ -577,23 +602,34 @@ def _resolve_static_write_target(node: ast.Call, raw_aliases, imports) -> str | 
             return os.path.expanduser(rhs.args[0].value)
     # h = os.path.expanduser; h("~/.hermes/config.yaml") — 函数引用别名
     # （2026-08-26 复现：敏感写目标解析曾漏掉此形式，退化为审批而非硬阻断）
-    if (isinstance(target_expr, ast.Call) and isinstance(target_expr.func, ast.Name)
-            and _resolve_alias_value(target_expr.func.id, imports, raw_aliases)
+    if (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)
+            and _resolve_alias_value(expr.func.id, imports, raw_aliases)
             == ("os.path", "expanduser")
-            and target_expr.args and isinstance(target_expr.args[0], ast.Constant)
-            and isinstance(target_expr.args[0].value, str)):
-        return os.path.expanduser(target_expr.args[0].value)
+            and expr.args and isinstance(expr.args[0], ast.Constant)
+            and isinstance(expr.args[0].value, str)):
+        return os.path.expanduser(expr.args[0].value)
     # os.path.expanduser("~/.hermes/config.yaml") inline as first arg
-    if (isinstance(target_expr, ast.Call) and isinstance(target_expr.func, ast.Attribute)
-            and isinstance(target_expr.func.value, ast.Attribute)
-            and isinstance(target_expr.func.value.value, ast.Name)
-            and target_expr.func.value.value.id == "os"
-            and target_expr.func.value.attr == "path"
-            and target_expr.func.attr == "expanduser"
-            and target_expr.args and isinstance(target_expr.args[0], ast.Constant)
-            and isinstance(target_expr.args[0].value, str)):
-        return os.path.expanduser(target_expr.args[0].value)
+    if (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)
+            and isinstance(expr.func.value, ast.Attribute)
+            and isinstance(expr.func.value.value, ast.Name)
+            and expr.func.value.value.id == "os"
+            and expr.func.value.attr == "path"
+            and expr.func.attr == "expanduser"
+            and expr.args and isinstance(expr.args[0], ast.Constant)
+            and isinstance(expr.args[0].value, str)):
+        return os.path.expanduser(expr.args[0].value)
     return None
+
+
+def _resolve_static_write_target(node: ast.Call, raw_aliases, imports) -> str | None:
+    """Try to resolve an open()/Path() first-arg target to a literal path.
+
+    Thin wrapper over ``_resolve_expr_path`` for the legacy call shape
+    (first positional argument).
+    """
+    if not node.args:
+        return None
+    return _resolve_expr_path(node.args[0], raw_aliases, imports)
 
 
 def _write_target_is_sensitive(path: str) -> bool:
@@ -671,6 +707,58 @@ def _execute_code_has_sensitive_write(code: str) -> str | None:
                     target = _resolve_static_write_target(base, raw_aliases, imports)
                     if target and _write_target_is_sensitive(target):
                         return target
+    return None
+
+
+def _execute_code_touches_sensitive_path(code: str) -> str | None:
+    """Return the protected target if any *library* call's path argument
+    statically references a sensitive destination.
+
+    Closes the #49578 residual surface found 2026-08-26: pandas/numpy and
+    other third-party writers (``to_csv``/``save``/``dump``/...) accept
+    arbitrary path strings that never match the open()/Path() AST shapes
+    checked by ``_execute_code_has_sensitive_write`` — so
+    ``pd.DataFrame(...).to_csv('/root/.ssh/authorized_keys')`` sailed
+    straight through.  Any call whose method is NOT in the read-only
+    query whitelist and whose positional/keyword arguments statically
+    resolve to a sensitive path is hard-blocked.  Read-only access
+    (os.path queries, existence checks, directory listing, content
+    reads) stays allowed, matching the open() read-mode behaviour.
+    """
+    imports, star_modules, raw_aliases = _collect_exec_code_bindings(code)
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+
+        # 只检查属性方法调用（obj.method(...)）；裸函数名调用（Path(...)、
+        # open(...) 等构造函数/内置）由各自的形状检测负责——否则
+        # ``Path('/root/.hermes').exists()`` 的构造参数会被误伤为敏感引用。
+        if isinstance(func, ast.Attribute):
+            method = func.attr
+        else:
+            continue
+
+        if method in _EXEC_CODE_READONLY_QUERY_NAMES:
+            continue
+        # open()/Path() 写形状已在 _execute_code_has_sensitive_write 单独
+        # 处理；这里跳过避免重复判定（其只读形态合法，不升级）。
+        resolved = _resolve_call_target(
+            func, imports, star_modules, raw_aliases, _EXEC_CODE_DANGEROUS_CALLS
+        )
+        if resolved in (("builtins", "open"), ("pathlib", "open")):
+            continue
+
+        # 检查所有位置参数 + 关键字参数是否静态解析为敏感路径
+        for arg in list(node.args) + [kw.value for kw in node.keywords]:
+            target = _resolve_expr_path(arg, raw_aliases, imports)
+            if target and _write_target_is_sensitive(target):
+                return target
     return None
 
 
