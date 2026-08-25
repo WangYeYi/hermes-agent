@@ -73,6 +73,14 @@ _EXEC_CODE_DANGEROUS_CALLS = {
 # ``ctypes.CDLL(None).unlink(...)`` 无需 os.remove 即可绕过所有检查。
 _EXEC_CODE_SUSPICIOUS_IMPORTS = frozenset({"ctypes"})
 
+# Builtin 危险名称（2026-08-26 复现发现）：``op = open``、``e = eval``、
+# ``from builtins import open as op`` 等别名形式曾绕过基于 ``func.id`` 的
+# 直接检测（open/eval/exec 检测分支只匹配裸名字）。解析为
+# ``("builtins", name)`` 后与模块属性检测统一走 ``_resolve_call_target``。
+_EXEC_CODE_DANGEROUS_BUILTINS = frozenset({
+    "open", "eval", "exec", "compile", "__import__",
+})
+
 # =========================================================================
 # Layer 3 — Hard Block: Self-Destructive / Process-Killing Operations
 # =========================================================================
@@ -106,8 +114,14 @@ def _resolve_alias_value(name, imports, raw_aliases, seen=None):
       - ``killer = os.kill`` → ('os', 'kill')   （函数别名）
       - ``b = a.kill``    → ('os', 'kill')      （链式别名）
       - ``x = getattr(os, 'kill')`` → ('os', 'kill')
+      - ``h = os.path.expanduser`` → ('os.path', 'expanduser')（2026-08-26）
+      - ``op = open`` / ``e = eval`` → ('builtins', name)（2026-08-26：
+        builtin 别名曾绕过 open/eval/exec 检测分支）
     解析不了返回 None。
     """
+    # Builtin 名优先：直接调用（open(...)）与别名 RHS（op = open）都落到这里。
+    if name in _EXEC_CODE_DANGEROUS_BUILTINS:
+        return ("builtins", name)
     if name not in raw_aliases:
         return None
     if seen is None:
@@ -133,6 +147,19 @@ def _resolve_alias_value(name, imports, raw_aliases, seen=None):
         if base:
             m, a = base
             return (m, expr.attr) if a is None else (m, a)
+
+    # h = os.path.expanduser — os.path 子模块属性链（2026-08-26：敏感写
+    # 目标解析曾漏掉此函数引用别名，退化为审批而非硬阻断）
+    if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Attribute):
+        inner = expr.value
+        if (inner.attr == "path" and isinstance(inner.value, ast.Name)
+                and inner.value.id in imports
+                and imports[inner.value.id][0] == "os"):
+            return ("os.path", expr.attr)
+        if (inner.attr == "path" and isinstance(inner.value, ast.Name)
+                and _resolve_alias_value(inner.value.id, imports, raw_aliases, seen)
+                == ("os", None)):
+            return ("os.path", expr.attr)
 
     # x = getattr(os, 'kill')
     if isinstance(expr, ast.Call) and getattr(expr.func, "id", None) == "getattr":
@@ -453,21 +480,27 @@ def _execute_code_has_dangerous_ops(code: str):
             continue
         func = node.func
 
-        # 内置 open() — 区分读写模式（只读放行，写拦截）
-        if isinstance(func, ast.Name) and func.id == "open":
+        resolved = _resolve_call_target(
+            func, imports, star_modules, raw_aliases, _EXEC_CODE_DANGEROUS_CALLS
+        )
+
+        # 内置 open() — 区分读写模式（只读放行，写拦截）。resolved 覆盖
+        # 直接调用、``op = open`` 赋值别名、``from builtins import open as op``
+        # （2026-08-26 复现：赋值别名曾绕过此检测）。
+        if resolved == ("builtins", "open"):
             if _open_mode_is_write(node):
                 return "open-write"
             continue  # 只读 open，放行
 
         # eval/exec/compile — 动态代码执行（review Blocker 2 举一反三：
         # ``eval("os.kill")(...)`` 的外层 callee 是 eval 调用，普通解析器
-        # 不处理；字面量 eval 是静态可检测的，动态字符串拼接无法检测）
-        if isinstance(func, ast.Name) and func.id in ("eval", "exec", "compile"):
+        # 不处理；字面量 eval 是静态可检测的，动态字符串拼接无法检测。
+        # 别名形式（``e = eval``）同样解析为 ("builtins", "eval")）
+        if resolved in (
+            ("builtins", "eval"), ("builtins", "exec"), ("builtins", "compile"),
+        ):
             return "dynamic-exec"
 
-        resolved = _resolve_call_target(
-            func, imports, star_modules, raw_aliases, _EXEC_CODE_DANGEROUS_CALLS
-        )
         if resolved is None:
             continue
         m, a = resolved
@@ -514,12 +547,13 @@ _STRING_CONSTANT_EVAL_RE = re.compile(
 )
 
 
-def _resolve_static_write_target(node: ast.Call, raw_aliases) -> str | None:
+def _resolve_static_write_target(node: ast.Call, raw_aliases, imports) -> str | None:
     """Try to resolve an open()/Path() first-arg target to a literal path.
 
     Handles: string literal, ``os.path.expanduser("...")`` with a literal,
-    and a simple variable alias whose RHS is one of those.  Returns None
-    when the target is not statically resolvable.
+    a simple variable alias whose RHS is one of those, and (2026-08-26) a
+    function-reference alias ``h = os.path.expanduser; h("...")``.  Returns
+    None when the target is not statically resolvable.
     """
     if not node.args:
         return None
@@ -541,6 +575,14 @@ def _resolve_static_write_target(node: ast.Call, raw_aliases) -> str | None:
                 and rhs.args and isinstance(rhs.args[0], ast.Constant)
                 and isinstance(rhs.args[0].value, str)):
             return os.path.expanduser(rhs.args[0].value)
+    # h = os.path.expanduser; h("~/.hermes/config.yaml") — 函数引用别名
+    # （2026-08-26 复现：敏感写目标解析曾漏掉此形式，退化为审批而非硬阻断）
+    if (isinstance(target_expr, ast.Call) and isinstance(target_expr.func, ast.Name)
+            and _resolve_alias_value(target_expr.func.id, imports, raw_aliases)
+            == ("os.path", "expanduser")
+            and target_expr.args and isinstance(target_expr.args[0], ast.Constant)
+            and isinstance(target_expr.args[0].value, str)):
+        return os.path.expanduser(target_expr.args[0].value)
     # os.path.expanduser("~/.hermes/config.yaml") inline as first arg
     if (isinstance(target_expr, ast.Call) and isinstance(target_expr.func, ast.Attribute)
             and isinstance(target_expr.func.value, ast.Attribute)
@@ -602,29 +644,31 @@ def _execute_code_has_sensitive_write(code: str) -> str | None:
             continue
         func = node.func
 
+        resolved = _resolve_call_target(
+            func, imports, star_modules, raw_aliases, _EXEC_CODE_DANGEROUS_CALLS
+        )
+
         # builtin open(...) / open(file, mode) with write mode
-        if isinstance(func, ast.Name) and func.id == "open":
+        # （resolved 覆盖 op = open 别名 / from builtins import open as op）
+        if resolved == ("builtins", "open"):
             if _open_mode_is_write(node):
-                target = _resolve_static_write_target(node, raw_aliases)
+                target = _resolve_static_write_target(node, raw_aliases, imports)
                 if target and _write_target_is_sensitive(target):
                     return target
             continue
 
         # Path(...).write_text / write_bytes / open(write)
-        resolved = _resolve_call_target(
-            func, imports, star_modules, raw_aliases, _EXEC_CODE_DANGEROUS_CALLS
-        )
         if resolved == ("pathlib", "write_text") or resolved == ("pathlib", "write_bytes"):
             base = func.value  # Path(...) call
             if isinstance(base, ast.Call) and base.args:
-                target = _resolve_static_write_target(base, raw_aliases)
+                target = _resolve_static_write_target(base, raw_aliases, imports)
                 if target and _write_target_is_sensitive(target):
                     return target
         elif resolved == ("pathlib", "open"):
             if _path_open_mode_is_write(node):
                 base = func.value
                 if isinstance(base, ast.Call) and base.args:
-                    target = _resolve_static_write_target(base, raw_aliases)
+                    target = _resolve_static_write_target(base, raw_aliases, imports)
                     if target and _write_target_is_sensitive(target):
                         return target
     return None
