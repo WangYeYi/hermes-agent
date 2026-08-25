@@ -23,6 +23,9 @@ from tools.approval import (
     _execute_code_has_self_destructive_ops,
     check_execute_code_guard,
 )
+from tools.exec_code_policy import (
+    _execute_code_has_sensitive_write,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -144,10 +147,105 @@ def test_guard_hard_blocks_alias_after_yolo_check():
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Re-review (2026-08-25, andrexibiza) Blocker 1: sensitive-write invariant
+# ─────────────────────────────────────────────────────────────────────
+
+SENSITIVE_WRITE_CASES = [
+    # literal protected targets
+    'open("/root/.hermes/config.yaml", "a").write("injected")',
+    'open("/root/.ssh/authorized_keys", "a").write("key")',
+    'with open("/root/.hermes/config.yaml", "a") as f:\n    f.write("injected")',
+    # expanduser forms (the #49578 reproducer shape)
+    'import os\ntarget = os.path.expanduser("~/.hermes/config.yaml")\nwith open(target, "a") as f:\n    f.write("injected")',
+    'import os\nopen(os.path.expanduser("~/.hermes/config.yaml"), "a").write("x")',
+    # pathlib to protected targets
+    'from pathlib import Path\nPath("/root/.ssh/authorized_keys").write_text("key")',
+    'from pathlib import Path\nwith Path("/etc/passwd").open("a") as f:\n    f.write("x")',
+    # simple variable alias
+    'target = "/root/.hermes/config.yaml"\nopen(target, "a").write("x")',
+]
+
+
+@pytest.mark.parametrize("code", SENSITIVE_WRITE_CASES)
+def test_sensitive_write_target_detected(code):
+    assert _execute_code_has_sensitive_write(code) is not None
+
+
+@pytest.mark.parametrize("code", [
+    'open("/tmp/x.txt", "w").write("x")',
+    'open("/home/user/project/a.py", "w").write("x")',
+    'open("/root/.hermes/config.yaml", "r").read()',
+    'from pathlib import Path\nPath("/root/.hermes/config.yaml").read_text()',
+])
+def test_non_sensitive_write_passes(code):
+    assert _execute_code_has_sensitive_write(code) is None
+
+
+@pytest.mark.parametrize("mode_gate", ["normal", "yolo", "off"])
+def test_sensitive_write_hard_blocked_in_all_modes(monkeypatch, mode_gate):
+    """The #49578 destination invariant must hold even when approval is
+    turned off — the sensitive-write check runs before the yolo/mode-off
+    bypass gates (re-review Blocker 1)."""
+    code = ('import os\ntarget = os.path.expanduser("~/.hermes/config.yaml")\n'
+            'with open(target, "a") as f:\n    f.write("injected")')
+
+    import tools.approval as approval_module
+    if mode_gate == "yolo":
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    elif mode_gate == "off":
+        monkeypatch.setattr(
+            approval_module, "_get_approval_mode", lambda: "off"
+        )
+    # normal: nothing to patch — env_type="local" goes through the guard
+
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["approved"] is False
+    assert result["outcome"] == "hard_blocked"
+    assert "protected path" in result["message"]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Re-review (2026-08-25) Blocker 2: eval/exec dynamic-exec detection
+# ─────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("code", [
+    'import os\neval("os.kill")(os.getpid(), 15)',
+    'exec("os.kill(os.getpid(), 15)")',
+    'import os\ncompile("os.kill(1,9)", "<s>", "exec")',
+])
+def test_eval_exec_dynamic_code_flagged(code):
+    """eval("os.kill")(...) escapes the hard-block resolver (outer callee
+    is eval) but must not fall through to auto-approve — it is flagged as
+    dynamic-exec and requires approval."""
+    assert _execute_code_has_dangerous_ops(code) == "dynamic-exec"
+
+
+def test_eval_exec_guard_not_auto_approved(monkeypatch):
+    """dynamic-exec must fall through to the approval prompt rather than
+    the danger_reason-is-None auto-approve path."""
+    import tools.approval as approval_module
+    # Force CLI-like path: not gateway, not ask, not yolo, not off.
+    monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(approval_module, "_is_single_query_approval_context", lambda: False)
+    monkeypatch.setattr(approval_module, "_is_cron_approval_context", lambda: False)
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+    result = check_execute_code_guard(
+        'import os\neval("os.kill")(os.getpid(), 15)', env_type="local"
+    )
+    # It must NOT be auto-approved; it should be blocked/ask for approval.
+    assert result["approved"] is False or result.get("outcome") in (
+        "blocked", "denied", "pending",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Conversation-loop user-denial halt (plain-text + JSON-wrapped BLOCKED)
 # ─────────────────────────────────────────────────────────────────────
 
-from agent.conversation_loop import _tool_results_contain_user_blocked
+from agent.conversation_loop import (
+    _tool_results_contain_user_blocked,
+    _user_blocked_halt_response,
+)
 
 
 def _tool_msgs(*contents):
@@ -194,3 +292,51 @@ def test_only_trailing_tool_messages_scanned():
         {"role": "tool", "content": "all good"},
     ]
     assert _tool_results_contain_user_blocked(messages) is False
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Loop-boundary control flow: exit reason + no-retry semantics
+# (2026-08-25 re-review: parser recognition alone does not prove
+# termination semantics)
+# ─────────────────────────────────────────────────────────────────────
+
+class _FakeAgent:
+    """Minimal agent stub with the halt side-effect surface."""
+
+    def __init__(self):
+        self.emitted = []
+        self.printed = []
+        self.streamed = []
+        self.stream_delta_callback = self._stream
+
+    def _emit_status(self, text):
+        self.emitted.append(text)
+
+    def _safe_print(self, text):
+        self.printed.append(text)
+
+    def _stream(self, text):
+        self.streamed.append(text)
+
+
+def test_user_blocked_halt_sets_exit_reason_and_appends_response():
+    agent = _FakeAgent()
+    messages = _tool_msgs('{"status": "error", "error": "BLOCKED: User denied"}')
+    result = _user_blocked_halt_response(agent, messages)
+
+    assert result == ("user_blocked", "操作被拒绝。请指示下一步。")
+    # Side effects: status emitted, response appended, stream flushed.
+    assert agent.emitted and "用户拒绝了危险操作" in agent.emitted[0]
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"] == "操作被拒绝。请指示下一步。"
+    assert agent.printed and "操作被拒绝" in agent.printed[0]
+
+
+def test_user_blocked_halt_returns_none_without_denial():
+    agent = _FakeAgent()
+    messages = _tool_msgs("command output ok")
+    assert _user_blocked_halt_response(agent, messages) is None
+    # No side effects when there is no denial.
+    assert agent.emitted == []
+    assert agent.printed == []
+    assert messages[-1]["role"] == "tool"

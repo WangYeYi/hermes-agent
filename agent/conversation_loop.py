@@ -278,6 +278,37 @@ def _tool_results_contain_user_blocked(messages: List[Dict[str, Any]]) -> bool:
     return False
 
 
+def _user_blocked_halt_response(agent, messages) -> tuple[str, str] | None:
+    """If trailing tool messages show a user denial, perform the halt
+    side effects and return ``(exit_reason, final_response)``; else None.
+
+    Extracted from the main loop (2026-08-25 re-review): the user-denial
+    halt must be testable at the loop boundary — parser recognition alone
+    does not prove termination semantics.  The caller breaks the loop on
+    a non-None return, so no further model call or tool retry happens.
+    """
+    if not _tool_results_contain_user_blocked(messages):
+        return None
+    _turn_exit_reason = "user_blocked"
+    _final_response = "操作被拒绝。请指示下一步。"
+    agent._emit_status(
+        "⛔ 用户拒绝了危险操作 — 已停止 Agent 循环"
+    )
+    messages.append(
+        {"role": "assistant", "content": _final_response}
+    )
+    if agent.stream_delta_callback:
+        try:
+            agent.stream_delta_callback(_final_response)
+            agent.stream_delta_callback(None)
+        except Exception:
+            pass
+    agent._safe_print(f"\n{_final_response}\n")
+    return _turn_exit_reason, _final_response
+
+
+
+
 def _restore_user_after_reference_handoff(
     messages: List[Dict[str, Any]], user_message: Any
 ) -> bool:
@@ -7721,27 +7752,10 @@ def run_conversation(
                 # user's explicit deny.  Scan the tool messages just
                 # produced and force-stop the turn when a BLOCKED is
                 # found so the user's decision is respected.
-                _user_blocked = _tool_results_contain_user_blocked(messages)
-                if _user_blocked:
-                    _turn_exit_reason = "user_blocked"
-                    final_response = (
-                        "操作被拒绝。请指示下一步。"
-                    )
-                    agent._emit_status(
-                        "⛔ 用户拒绝了危险操作 — 已停止 Agent 循环"
-                    )
-                    messages.append(
-                        {"role": "assistant", "content": final_response}
-                    )
-                    if agent.stream_delta_callback:
-                        try:
-                            agent.stream_delta_callback(final_response)
-                            agent.stream_delta_callback(None)
-                        except Exception:
-                            pass
-                    agent._safe_print(f"\n{final_response}\n")
+                _user_blocked_halt = _user_blocked_halt_response(agent, messages)
+                if _user_blocked_halt is not None:
+                    _turn_exit_reason, final_response = _user_blocked_halt
                     break
-
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
