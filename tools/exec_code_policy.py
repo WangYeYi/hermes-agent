@@ -137,7 +137,7 @@ def _resolve_alias_value(name, imports, raw_aliases, seen=None):
             return imports[expr.id]
         return _resolve_alias_value(expr.id, imports, raw_aliases, seen)
 
-    # killer = os.kill / b = a.kill
+    # killer = os.kill / b = a.kill / h = p.expanduser（p = os.path）
     if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
         base = None
         if expr.value.id in imports:
@@ -146,7 +146,13 @@ def _resolve_alias_value(name, imports, raw_aliases, seen=None):
             base = _resolve_alias_value(expr.value.id, imports, raw_aliases, seen)
         if base:
             m, a = base
-            return (m, expr.attr) if a is None else (m, a)
+            # 组合属性链（2026-08-26 re-review）：base 已带属性时（如
+            # p = os.path → ('os', 'path')），下一层属性必须组合成
+            # ('os.path', attr)，否则 p.expanduser 会被错误解析成
+            # ('os', 'path')，敏感写目标解析彻底丢失。
+            if a is None:
+                return (m, expr.attr)
+            return (f"{m}.{a}", expr.attr)
 
     # h = os.path.expanduser — os.path 子模块属性链（2026-08-26：敏感写
     # 目标解析曾漏掉此函数引用别名，退化为审批而非硬阻断）
@@ -169,6 +175,46 @@ def _resolve_alias_value(name, imports, raw_aliases, seen=None):
             if (a is None and isinstance(expr.args[1], ast.Constant)
                     and isinstance(expr.args[1].value, str)):
                 return (m, expr.args[1].value)
+
+    # x = o.__dict__["killpg"] — __dict__ 动态访问的二次别名
+    # （2026-08-26 re-review 举一反三：o = os 后再经 __dict__ 取函数）
+    if isinstance(expr, ast.Subscript):
+        val = expr.value
+        if (isinstance(val, ast.Attribute) and val.attr == "__dict__"
+                and isinstance(val.value, ast.Name)):
+            m = None
+            if val.value.id in imports:
+                m = imports[val.value.id][0]
+            else:
+                base = _resolve_alias_value(val.value.id, imports, raw_aliases, seen)
+                if base:
+                    m = base[0]
+            if (m is not None and isinstance(expr.slice, ast.Constant)
+                    and isinstance(expr.slice.value, str)):
+                return (m, expr.slice.value)
+    return None
+
+
+def _resolve_attribute_chain(expr, imports, raw_aliases, seen=None):
+    """把嵌套属性表达式解析为规范化 (module, attr)。
+
+    2026-08-26 re-review 补充：``os.path.expanduser`` 的 func 是三层
+    Attribute（expanduser → os.path → os），``_resolve_call_target`` 的
+    Attribute 分支只认 ``base`` 为 Name 的形状，嵌套属性 base 曾直接
+    return None——导致组合属性调用（``p = os.path; p.expanduser(...)``
+    之外还有 ``os.path.expanduser(...)`` 内联形式）解析失败。
+    """
+    if isinstance(expr, ast.Name):
+        if expr.id in imports:
+            return imports[expr.id]
+        return _resolve_alias_value(expr.id, imports, raw_aliases, seen)
+    if isinstance(expr, ast.Attribute):
+        base = _resolve_attribute_chain(expr.value, imports, raw_aliases, seen)
+        if base:
+            m, a = base
+            if a is None:
+                return (m, expr.attr)
+            return (f"{m}.{a}", expr.attr)
     return None
 
 
@@ -188,6 +234,25 @@ def _expr_is_path_constructor(expr, imports, raw_aliases):
             return imports[f.value.id][0] == "pathlib"
         return _resolve_alias_value(f.value.id, imports, raw_aliases) == ("pathlib", None)
     return False
+
+
+def _resolve_path_constructor(expr, raw_aliases, imports):
+    """把 Path 构造调用解析出来：直接 ``Path("...")`` / ``pathlib.Path("...")``
+    或存进变量的对象 ``p = Path("...")``（含链式 ``q = p``）。
+
+    2026-08-26 re-review（andrexibiza Blocker 2b）：call-valued RHS 不在
+    抽象绑定图里，``p = Path("~/.hermes/config.yaml"); p.write_text("x")``
+    曾完全逃过敏感写形状检测。返回 ast.Call 节点（可继续取构造参数），
+    解析不了返回 None。
+    """
+    if isinstance(expr, ast.Name):
+        rhs = raw_aliases.get(expr.id)
+        if rhs is not None:
+            return _resolve_path_constructor(rhs, raw_aliases, imports)
+        return None
+    if _expr_is_path_constructor(expr, imports, raw_aliases):
+        return expr
+    return None
 
 
 def _collect_exec_code_bindings(code):
@@ -219,9 +284,13 @@ def _collect_exec_code_bindings(code):
                     continue
                 name = alias.asname or alias.name
                 imports[name] = (module, alias.name)
-        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
-            if isinstance(node.targets[0], ast.Name):
-                raw_aliases[node.targets[0].id] = node.value
+        elif isinstance(node, ast.Assign):
+            # 多重赋值 a = b = os.kill → targets=[a, b]，每个名字都绑定同一 RHS
+            # （2026-08-26 re-review：曾只记录 len(targets)==1，多重赋值完全
+            # 逃出绑定图 → a = b = os.kill 绕过 hard block）
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    raw_aliases[t.id] = node.value
     return imports, star_modules, raw_aliases
 
 
@@ -253,24 +322,35 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
                 return (mod, name)
         return None
 
-    # ── ast.Attribute: os.kill(...) / o.kill(...) / Path(x).write_text(...) ──
+    # ── ast.Attribute: os.kill(...) / o.kill(...) / os.path.expanduser(...)
+    #    / Path(x).write_text(...) / p.write_text(...) ──
     if isinstance(func, ast.Attribute):
         attr = func.attr
         base = func.value
-        # Path(...).write_text(...) — pathlib 写方法
-        if _expr_is_path_constructor(base, imports, raw_aliases):
+        # Path 构造（直接 / pathlib.Path / P 别名 / 变量存对象 p = Path(...)）
+        if _resolve_path_constructor(base, raw_aliases, imports) is not None:
             return ("pathlib", attr)
+        resolved_base = None
         if isinstance(base, ast.Name):
-            bname = base.id
-            if bname == "Path":
+            if base.id == "Path":
                 return ("pathlib", attr)
-            alias = _resolve_alias_value(bname, imports, raw_aliases)
-            if alias is not None:
-                m, a = alias
-                return (m, attr) if a is None else (m, a)
-            if bname in imports:
-                m, a = imports[bname]
-                return (m, attr) if a is None else (m, a)
+            if base.id in imports:
+                resolved_base = imports[base.id]
+            else:
+                # 赋值别名：killer = os.kill 的 base 是 os；o.kill 的 base 是 o；
+                # p.expanduser 的 base 是 p（p = os.path，组合属性）
+                resolved_base = _resolve_alias_value(base.id, imports, raw_aliases)
+        elif isinstance(base, ast.Attribute):
+            # 嵌套属性 base：os.path.expanduser 的 base 是 os.path
+            # （2026-08-26 re-review：此前只认 Name base，直接 return None）
+            resolved_base = _resolve_attribute_chain(base, imports, raw_aliases)
+        if resolved_base is not None:
+            m, a = resolved_base
+            # 组合属性链：o = os.path 后 o.expanduser(...) 必须解析成
+            # ('os.path', 'expanduser') 而非 ('os', 'path')。
+            if a is None:
+                return (m, attr)
+            return (f"{m}.{a}", attr)
         return None
 
     # ── ast.Call: getattr(os, 'kill')(...) ──
@@ -290,7 +370,7 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
                 return (m, None)  # 动态属性名 — 由调用方决定是否保守拦截
         return None
 
-    # ── ast.Subscript: os.__dict__['kill'](...) ──
+    # ── ast.Subscript: os.__dict__['kill'](...) / o.__dict__['kill'](...) ──
     if isinstance(func, ast.Subscript):
         val = func.value
         if (isinstance(val, ast.Attribute) and val.attr == "__dict__"
@@ -298,6 +378,13 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
             m = None
             if val.value.id in imports:
                 m = imports[val.value.id][0]
+            else:
+                # o = os; o.__dict__["kill"](...) — base 是赋值别名
+                # （2026-08-26 re-review：__dict__ 分支只查 imports，
+                # 别名模块完全逃过 hard block）
+                alias = _resolve_alias_value(val.value.id, imports, raw_aliases)
+                if alias is not None:
+                    m = alias[0]
             if (m is not None and isinstance(func.slice, ast.Constant)
                     and isinstance(func.slice.value, str)):
                 return (m, func.slice.value)
@@ -600,23 +687,17 @@ def _resolve_expr_path(expr, raw_aliases, imports) -> str | None:
                 and rhs.args and isinstance(rhs.args[0], ast.Constant)
                 and isinstance(rhs.args[0].value, str)):
             return os.path.expanduser(rhs.args[0].value)
-    # h = os.path.expanduser; h("~/.hermes/config.yaml") — 函数引用别名
-    # （2026-08-26 复现：敏感写目标解析曾漏掉此形式，退化为审批而非硬阻断）
-    if (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name)
-            and _resolve_alias_value(expr.func.id, imports, raw_aliases)
-            == ("os.path", "expanduser")
-            and expr.args and isinstance(expr.args[0], ast.Constant)
-            and isinstance(expr.args[0].value, str)):
-        return os.path.expanduser(expr.args[0].value)
-    # os.path.expanduser("~/.hermes/config.yaml") inline as first arg
-    if (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)
-            and isinstance(expr.func.value, ast.Attribute)
-            and isinstance(expr.func.value.value, ast.Name)
-            and expr.func.value.value.id == "os"
-            and expr.func.value.attr == "path"
-            and expr.func.attr == "expanduser"
-            and expr.args and isinstance(expr.args[0], ast.Constant)
-            and isinstance(expr.args[0].value, str)):
+    # 任意可解析的 expanduser 函数引用 — 统一走 _resolve_call_target：
+    #   h = os.path.expanduser; h("...")（函数引用别名）
+    #   p = os.path; p.expanduser("...")（组合属性别名，2026-08-26 re-review）
+    #   os.path.expanduser("...")（直接调用）
+    # 曾各自写死 AST 形状，组合属性链漏掉导致敏感写目标解析丢失。
+    if (isinstance(expr, ast.Call) and expr.args
+            and isinstance(expr.args[0], ast.Constant)
+            and isinstance(expr.args[0].value, str)
+            and _resolve_call_target(
+                expr.func, imports, set(), raw_aliases, frozenset()
+            ) == ("os.path", "expanduser")):
         return os.path.expanduser(expr.args[0].value)
     return None
 
@@ -693,18 +774,23 @@ def _execute_code_has_sensitive_write(code: str) -> str | None:
                     return target
             continue
 
-        # Path(...).write_text / write_bytes / open(write)
-        if resolved == ("pathlib", "write_text") or resolved == ("pathlib", "write_bytes"):
-            base = func.value  # Path(...) call
-            if isinstance(base, ast.Call) and base.args:
-                target = _resolve_static_write_target(base, raw_aliases, imports)
+        # Path(...).write_text / write_bytes / open(write) — 含变量存对象
+        # p = Path("..."); p.write_text("x")（2026-08-26 re-review Blocker 2b）
+        if resolved in (("pathlib", "write_text"), ("pathlib", "write_bytes")):
+            if not isinstance(func, ast.Attribute):
+                continue
+            ctor = _resolve_path_constructor(func.value, raw_aliases, imports)
+            if ctor is not None and ctor.args:
+                target = _resolve_expr_path(ctor.args[0], raw_aliases, imports)
                 if target and _write_target_is_sensitive(target):
                     return target
         elif resolved == ("pathlib", "open"):
             if _path_open_mode_is_write(node):
-                base = func.value
-                if isinstance(base, ast.Call) and base.args:
-                    target = _resolve_static_write_target(base, raw_aliases, imports)
+                if not isinstance(func, ast.Attribute):
+                    continue
+                ctor = _resolve_path_constructor(func.value, raw_aliases, imports)
+                if ctor is not None and ctor.args:
+                    target = _resolve_expr_path(ctor.args[0], raw_aliases, imports)
                     if target and _write_target_is_sensitive(target):
                         return target
     return None
