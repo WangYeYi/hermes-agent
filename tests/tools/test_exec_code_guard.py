@@ -498,3 +498,153 @@ def test_library_writer_guard_returns_hard_blocked_outcome():
     )
     assert result["approved"] is False
     assert result["outcome"] == "hard_blocked"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2026-08-26 re-review (andrexibiza, head 828e13e35): 剩余静态绑定缺口
+# ─────────────────────────────────────────────────────────────────────
+# Blocker 1: 进程kill硬阻断仍可被普通赋值形式绕过
+#   - 多重赋值 a = b = os.kill（_collect_exec_code_bindings 只记录
+#     len(targets)==1，多重赋值整个逃出绑定图）
+#   - __dict__ 动态访问经赋值别名 o = os（__dict__ 分支只查 imports）
+# Blocker 2: #49578 敏感目标仍有别名/对象缺口
+#   - 组合属性别名 p = os.path; h = p.expanduser（base 已带属性时返回
+#     ('os','path') 而非组合 ('os.path','expanduser')）
+#   - Path 对象存变量 p = Path(...); p.write_text（call-valued RHS 不在
+#     抽象绑定图）
+# 全部要求通过 check_execute_code_guard() 端到端回归（helper 级不够）。
+
+MULTI_TARGET_KILL_CASES = [
+    'import os\na = b = os.kill\na(os.getpid(), 15)',
+    'import os\na = b = c = os.killpg\na(0, 9)',
+    # 链式 + 多重赋值组合
+    'import os\nk = os\na = b = k.kill\na(os.getpid(), 15)',
+]
+
+@pytest.mark.parametrize("code", MULTI_TARGET_KILL_CASES)
+def test_multi_target_kill_hard_blocked(code):
+    """多重赋值 a = b = os.kill 必须命中 hard block（曾逃出绑定图）。"""
+    assert _execute_code_has_self_destructive_ops(code) is not None
+
+
+@pytest.mark.parametrize("code", [
+    'import os\no = os\no.__dict__["kill"](os.getpid(), 15)',
+    'import os\no = os\nx = o.__dict__["killpg"]\nx(0, 9)',
+])
+def test_dict_access_via_alias_hard_blocked(code):
+    """o = os; o.__dict__["kill"] 必须命中 hard block（__dict__ 分支曾只查 imports）。"""
+    assert _execute_code_has_self_destructive_ops(code) is not None
+
+
+def test_multi_target_kill_guard_hard_blocked():
+    """guard 端到端：多重赋值 kill 返回 hard_blocked（re-review 要求）。"""
+    result = check_execute_code_guard(
+        'import os\na = b = os.kill\na(os.getpid(), 15)', env_type="local"
+    )
+    assert result["approved"] is False
+    assert result["outcome"] == "hard_blocked"
+    assert "HARD BLOCKED" in result["message"]
+
+
+def test_dict_alias_kill_guard_hard_blocked():
+    """guard 端到端：别名 __dict__ kill 返回 hard_blocked。"""
+    result = check_execute_code_guard(
+        'import os\no = os\no.__dict__["kill"](os.getpid(), 15)', env_type="local"
+    )
+    assert result["approved"] is False
+    assert result["outcome"] == "hard_blocked"
+
+
+COMPOSED_ATTR_SENSITIVE_CASES = [
+    # p = os.path; h = p.expanduser（组合属性别名）
+    ('import os\np = os.path\nh = p.expanduser\n'
+     'with open(h("~/.hermes/config.yaml"), "a") as f:\n    f.write("x")'),
+    # p = os.path 后直接 p.expanduser(...)（resolve_call_target 组合链）
+    ('import os\np = os.path\n'
+     'open(p.expanduser("~/.hermes/config.yaml"), "a").write("x")'),
+]
+
+@pytest.mark.parametrize("code", COMPOSED_ATTR_SENSITIVE_CASES)
+def test_composed_attr_sensitive_write_detected(code):
+    """组合属性别名必须恢复敏感写目标（曾解析成 ('os','path') 丢失目标）。"""
+    assert _execute_code_has_sensitive_write(code) is not None
+
+
+PATH_OBJECT_VAR_SENSITIVE_CASES = [
+    'from pathlib import Path\np = Path("~/.hermes/config.yaml")\np.write_text("x")',
+    'from pathlib import Path\np = Path("/root/.ssh/authorized_keys")\np.write_bytes(b"key")',
+    'from pathlib import Path\np = Path("/root/.ssh/authorized_keys")\nwith p.open("a") as f:\n    f.write("x")',
+    'import pathlib\np = pathlib.Path("~/.hermes/config.yaml")\np.write_text("x")',
+    # 链式对象别名 q = p
+    'from pathlib import Path\np = Path("~/.hermes/config.yaml")\nq = p\nq.write_text("x")',
+    # Path 构造别名 P
+    'from pathlib import Path as P\np = P("~/.hermes/config.yaml")\np.write_text("x")',
+]
+
+@pytest.mark.parametrize("code", PATH_OBJECT_VAR_SENSITIVE_CASES)
+def test_path_object_var_sensitive_write_detected(code):
+    """Path 对象存变量后的写方法必须命中 #49578 不变量（曾完全逃过检测）。"""
+    assert _execute_code_has_sensitive_write(code) is not None
+
+
+@pytest.mark.parametrize("mode_gate", ["normal", "yolo", "off"])
+def test_composed_attr_sensitive_write_hard_blocked_in_all_modes(monkeypatch, mode_gate):
+    """组合属性敏感写在 yolo/approvals=off 下同样不可覆盖（#49578 不变量）。"""
+    code = ('import os\np = os.path\nh = p.expanduser\n'
+            'with open(h("~/.hermes/config.yaml"), "a") as f:\n    f.write("x")')
+
+    import tools.approval as approval_module
+    if mode_gate == "yolo":
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    elif mode_gate == "off":
+        monkeypatch.setattr(
+            approval_module, "_get_approval_mode", lambda: "off"
+        )
+
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["approved"] is False
+    assert result["outcome"] == "hard_blocked"
+    assert "protected path" in result["message"]
+
+
+@pytest.mark.parametrize("mode_gate", ["normal", "yolo", "off"])
+def test_path_object_var_sensitive_write_hard_blocked_in_all_modes(monkeypatch, mode_gate):
+    """Path 对象变量敏感写在 yolo/approvals=off 下同样不可覆盖。"""
+    code = ('from pathlib import Path\np = Path("~/.hermes/config.yaml")\n'
+            'p.write_text("x")')
+
+    import tools.approval as approval_module
+    if mode_gate == "yolo":
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    elif mode_gate == "off":
+        monkeypatch.setattr(
+            approval_module, "_get_approval_mode", lambda: "off"
+        )
+
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["approved"] is False
+    assert result["outcome"] == "hard_blocked"
+    assert "protected path" in result["message"]
+
+
+# 良性对照：新解析能力不得引入误报
+
+@pytest.mark.parametrize("code", [
+    # 多重赋值但目标无害
+    'import os\na = b = os.path.join\nprint(a("/tmp", "x"))',
+    # 组合属性但操作无害
+    'import os\np = os.path\nprint(p.join("/tmp", "x"))',
+    'import os\np = os.path\nprint(p.exists("/tmp"))',
+    # Path 对象变量：非敏感写放行、敏感只读放行、构造本身放行
+    'from pathlib import Path\np = Path("/tmp/x")\np.write_text("ok")',
+    'from pathlib import Path\np = Path("/root/.hermes/config.yaml")\nprint(p.exists())',
+    'from pathlib import Path\np = Path("/root/.hermes/config.yaml")\nprint(p.read_text())',
+    'from pathlib import Path\nprint(Path("/root/.ssh"))',
+    # 元组解包不是多重赋值别名
+    'a, b = 1, 2\nprint(a + b)',
+])
+def test_new_binding_shapes_benign_passes(code):
+    """新解析能力只影响危险形状，良性代码零误伤。"""
+    assert _execute_code_has_self_destructive_ops(code) is None
+    assert _execute_code_has_sensitive_write(code) is None
+    assert _execute_code_touches_sensitive_path(code) is None
