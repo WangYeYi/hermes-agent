@@ -239,6 +239,27 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
     return False
 
 
+def _extract_tool_content_text(content) -> str:
+    """Normalize a tool-result content value to plain text for BLOCKED scan.
+
+    Tool results are normally strings, but structurally-valid payloads can
+    be OpenAI-style content-block lists (``[{"type": "text", "text": ...}]``)
+    or dicts.  Without normalization a denial hidden inside such a shape
+    silently evades the halt (#65592 复测 2026-08-25).  Recursively extracts
+    the first error/text/content/message field, else returns "".
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(_extract_tool_content_text(c) for c in content)
+    if isinstance(content, dict):
+        for key in ("error", "text", "content", "message"):
+            if key in content:
+                return _extract_tool_content_text(content[key])
+        return ""
+    return ""
+
+
 def _tool_results_contain_user_blocked(messages: List[Dict[str, Any]]) -> bool:
     """Scan trailing tool messages for a user-denial BLOCKED marker.
 
@@ -247,34 +268,41 @@ def _tool_results_contain_user_blocked(messages: List[Dict[str, Any]]) -> bool:
     agent may retry the same intent with a different tool — a bypass of
     the user's explicit deny (#65592).
 
-    Covers three denial formats:
+    Covers the denial formats:
       - Plain-text BLOCKED (terminal/file_tools/approval)
       - ``["BLOCKED ...]`` list form
       - JSON-wrapped execute_code denial
         (``{"status":"error","error":"BLOCKED: ..."}`` — plain-text
         startswith misses this path, see #65592 review)
+    Tolerates leading whitespace before the marker/JSON and non-string
+    content shapes (list/dict) via ``_extract_tool_content_text``
+    (#65592 复测 2026-08-25).
     """
     for _msg in reversed(messages):
         if _msg.get("role") != "tool":
             break
-        _content = _msg.get("content", "")
-        if isinstance(_content, str):
-            # Plain-text BLOCKED — terminal/file_tools/approval
-            if _content.startswith("BLOCKED") or _content.startswith("[\"BLOCKED"):
-                return True
-            # JSON-wrapped BLOCKED — execute_code returns
-            # {"status":"error","error":"BLOCKED: ..."} when the
-            # user denies via approval guard.  The plain-text
-            # startswith check misses this path entirely.
-            if _content.startswith("{"):
-                try:
-                    parsed = json.loads(_content)
-                    if isinstance(parsed, dict):
-                        error = parsed.get("error", "")
-                        if isinstance(error, str) and error.startswith("BLOCKED"):
+        _content = _extract_tool_content_text(_msg.get("content", "")).lstrip()
+        # Plain-text BLOCKED — terminal/file_tools/approval
+        if _content.startswith("BLOCKED") or _content.startswith('["BLOCKED'):
+            return True
+        # JSON-wrapped BLOCKED — execute_code returns
+        # {"status":"error","error":"BLOCKED: ..."} when the
+        # user denies via approval guard.  The plain-text
+        # startswith check misses this path entirely.
+        if _content.startswith("{"):
+            try:
+                parsed = json.loads(_content)
+                if isinstance(parsed, dict):
+                    error = parsed.get("error", "")
+                    if isinstance(error, str) and error.startswith("BLOCKED"):
+                        return True
+                    # error 字段本身是 list/dict 形状时递归提取
+                    if not isinstance(error, str):
+                        err_text = _extract_tool_content_text(error)
+                        if err_text.startswith("BLOCKED"):
                             return True
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            except (json.JSONDecodeError, TypeError):
+                pass
     return False
 
 
