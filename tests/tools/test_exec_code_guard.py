@@ -340,3 +340,79 @@ def test_user_blocked_halt_returns_none_without_denial():
     assert agent.emitted == []
     assert agent.printed == []
     assert messages[-1]["role"] == "tool"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Builtin 别名绕过回归（2026-08-26 复现发现）
+# ``op = open`` / ``e = eval`` / ``from builtins import open as op`` 曾绕过
+# open/eval/exec 检测分支（只匹配裸名字 func.id），在 CLI 交互模式下
+# auto-approve；``op = open`` + expanduser 函数别名组合还击穿了 #49578
+# 敏感写不变量。修复：_resolve_alias_value 将 builtin 名解析为
+# ("builtins", name)，open/eval/exec 检测统一走 _resolve_call_target。
+# ─────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("code,reason", [
+    # open 赋值别名 → 写模式必须触发 open-write
+    ('op = open\nwith op("/tmp/t.txt", "w") as f:\n    f.write("x")', "open-write"),
+    # 链式赋值别名 g = f; f = open
+    ('f = open\ng = f\nwith g("/tmp/t.txt", "w") as fh:\n    fh.write("x")', "open-write"),
+    # builtins import 别名
+    ('from builtins import open as op\nop("/tmp/t.txt", "w").write("x")', "open-write"),
+    # eval/exec 赋值别名 → dynamic-exec
+    ('e = eval\ne("os.kill")(1, 15)', "dynamic-exec"),
+    ('x = exec\nx("import os; os.kill(1, 15)")', "dynamic-exec"),
+])
+def test_builtin_alias_forms_flagged(code, reason):
+    """builtin 别名（open/eval/exec）必须被危险扫描识别（曾绕过）。"""
+    assert _execute_code_has_dangerous_ops(code) == reason
+
+
+@pytest.mark.parametrize("code", [
+    # 只读别名不误报
+    'op = open\nwith op("data.txt", "r") as f:\n    print(f.read())',
+    # 非危险 builtin 别名不误报
+    'p = print\np("hi")',
+    'l = len\nprint(l([1, 2, 3]))',
+])
+def test_builtin_alias_benign_passes(code):
+    """无害 builtin 别名不得触发危险扫描。"""
+    assert _execute_code_has_dangerous_ops(code) is None
+
+
+def test_builtin_open_alias_not_auto_approved(monkeypatch):
+    """op = open 写文件必须落到审批弹窗，不能 auto-approve（2026-08-26 漏洞）。"""
+    import tools.approval as approval_module
+    monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(approval_module, "_is_single_query_approval_context", lambda: False)
+    monkeypatch.setattr(approval_module, "_is_cron_approval_context", lambda: False)
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+    result = check_execute_code_guard(
+        "op = open\nwith op('/tmp/t.txt', 'w') as f:\n    f.write('x')",
+        env_type="local",
+    )
+    assert result["approved"] is False or result.get("outcome") in (
+        "blocked", "denied", "pending",
+    )
+
+
+@pytest.mark.parametrize("code", [
+    # op = open + expanduser 变量目标（#49578 原始形状的别名版）
+    ('import os\nop = open\ntarget = os.path.expanduser("~/.hermes/config.yaml")\n'
+     'with op(target, "a") as f:\n    f.write("x")'),
+    # op = open + expanduser 函数别名组合（曾完整击穿不变量）
+    ('import os\nop = open\nh = os.path.expanduser\n'
+     'with op(h("~/.hermes/config.yaml"), "a") as f:\n    f.write("x")'),
+    # builtins import 别名 + 敏感目标
+    ('from builtins import open as op\n'
+     'op("~/.ssh/authorized_keys", "a").write("x")'),
+])
+def test_builtin_open_alias_sensitive_write_hard_blocked(code):
+    """builtin 别名写敏感目标必须命中 #49578 不变量（曾 auto-approved）。"""
+    assert _execute_code_has_sensitive_write(code) is not None
+
+
+def test_expanduser_function_alias_sensitive_write():
+    """h = os.path.expanduser 函数引用别名写敏感目标必须硬阻断（曾退化为审批）。"""
+    code = ('import os\nh = os.path.expanduser\n'
+            'with open(h("~/.hermes/config.yaml"), "a") as f:\n    f.write("x")')
+    assert _execute_code_has_sensitive_write(code) is not None
