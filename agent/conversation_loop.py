@@ -239,6 +239,45 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
     return False
 
 
+def _tool_results_contain_user_blocked(messages: List[Dict[str, Any]]) -> bool:
+    """Scan trailing tool messages for a user-denial BLOCKED marker.
+
+    When the user denies a dangerous command via the approval dialog, the
+    tool result is a BLOCKED string.  Without a dispatch-layer halt the
+    agent may retry the same intent with a different tool — a bypass of
+    the user's explicit deny (#65592).
+
+    Covers three denial formats:
+      - Plain-text BLOCKED (terminal/file_tools/approval)
+      - ``["BLOCKED ...]`` list form
+      - JSON-wrapped execute_code denial
+        (``{"status":"error","error":"BLOCKED: ..."}`` — plain-text
+        startswith misses this path, see #65592 review)
+    """
+    for _msg in reversed(messages):
+        if _msg.get("role") != "tool":
+            break
+        _content = _msg.get("content", "")
+        if isinstance(_content, str):
+            # Plain-text BLOCKED — terminal/file_tools/approval
+            if _content.startswith("BLOCKED") or _content.startswith("[\"BLOCKED"):
+                return True
+            # JSON-wrapped BLOCKED — execute_code returns
+            # {"status":"error","error":"BLOCKED: ..."} when the
+            # user denies via approval guard.  The plain-text
+            # startswith check misses this path entirely.
+            if _content.startswith("{"):
+                try:
+                    parsed = json.loads(_content)
+                    if isinstance(parsed, dict):
+                        error = parsed.get("error", "")
+                        if isinstance(error, str) and error.startswith("BLOCKED"):
+                            return True
+                except (json.JSONDecodeError, TypeError):
+                    pass
+    return False
+
+
 def _restore_user_after_reference_handoff(
     messages: List[Dict[str, Any]], user_message: Any
 ) -> bool:
@@ -7682,30 +7721,7 @@ def run_conversation(
                 # user's explicit deny.  Scan the tool messages just
                 # produced and force-stop the turn when a BLOCKED is
                 # found so the user's decision is respected.
-                _user_blocked = False
-                for _msg in reversed(messages):
-                    if _msg.get("role") != "tool":
-                        break
-                    _content = _msg.get("content", "")
-                    if isinstance(_content, str):
-                        # Plain-text BLOCKED — terminal/file_tools/approval
-                        if _content.startswith("BLOCKED") or _content.startswith("[\"BLOCKED"):
-                            _user_blocked = True
-                            break
-                        # JSON-wrapped BLOCKED — execute_code returns
-                        # {"status":"error","error":"BLOCKED: ..."} when
-                        # the user denies via approval guard.  The plain-
-                        # text startswith check misses this path entirely.
-                        if _content.startswith("{"):
-                            try:
-                                parsed = json.loads(_content)
-                                if isinstance(parsed, dict):
-                                    error = parsed.get("error", "")
-                                    if isinstance(error, str) and error.startswith("BLOCKED"):
-                                        _user_blocked = True
-                                        break
-                            except (json.JSONDecodeError, TypeError):
-                                pass
+                _user_blocked = _tool_results_contain_user_blocked(messages)
                 if _user_blocked:
                     _turn_exit_reason = "user_blocked"
                     final_response = (
@@ -8878,3 +8894,4 @@ def run_conversation(
 
 
 __all__ = ["run_conversation"]
+
