@@ -25,6 +25,7 @@ from tools.approval import (
 )
 from tools.exec_code_policy import (
     _execute_code_has_sensitive_write,
+    _execute_code_touches_sensitive_path,
 )
 
 
@@ -416,3 +417,84 @@ def test_expanduser_function_alias_sensitive_write():
     code = ('import os\nh = os.path.expanduser\n'
             'with open(h("~/.hermes/config.yaml"), "a") as f:\n    f.write("x")')
     assert _execute_code_has_sensitive_write(code) is not None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2026-08-26: #49578 残余面 — 库写方法（pandas/numpy）敏感路径参数
+# ─────────────────────────────────────────────────────────────────────
+# pd.to_csv('/root/.ssh/authorized_keys') 等调用接受任意路径字符串，绕过
+# open()/Path() AST 形状检测（复现：曾直接放行）。新增通用兜底
+# _execute_code_touches_sensitive_path：非只读方法调用携带静态可解析的
+# 敏感路径参数 → hard_blocked；只读/查询（os.path、存在性、目录列举、
+# read/load/read_*）保持放行。
+
+LIB_WRITE_SENSITIVE_CASES = [
+    # pandas 写方法 → 敏感目标（曾全部放行的复现形状）
+    'import pandas as pd\npd.DataFrame({"a": [1]}).to_csv("/root/.ssh/authorized_keys")',
+    'import pandas as pd\npd.DataFrame({"a": [1]}).to_json("/etc/hosts")',
+    'import pandas as pd\npd.DataFrame({"a": [1]}).to_pickle("~/.hermes/config.yaml")',
+    # numpy 写方法 → 敏感目标
+    'import numpy as np\nnp.savetxt("/root/.ssh/authorized_keys", np.array([1]))',
+    'import numpy as np\nnp.save("/root/.hermes/config.yaml", np.array([1]))',
+    # expanduser / 关键字参数 / 简单别名 变体
+    ('import pandas as pd, os\n'
+     'pd.DataFrame({"a": [1]}).to_csv(os.path.expanduser("~/.ssh/authorized_keys"))'),
+    'import pandas as pd\npd.DataFrame({"a": [1]}).to_csv(path="/root/.ssh/authorized_keys")',
+    'import pandas as pd\ntarget = "/root/.hermes/config.yaml"\npd.DataFrame({"a": [1]}).to_csv(target)',
+    # 写方法 + 别名模块
+    'import pandas as pd\npd.DataFrame({"a": [1]}).to_feather("/var/run/x")',
+]
+
+
+@pytest.mark.parametrize("code", LIB_WRITE_SENSITIVE_CASES)
+def test_library_writer_sensitive_path_detected(code):
+    """库写方法的敏感路径参数必须命中 #49578 不变量（曾直接放行）。"""
+    assert _execute_code_touches_sensitive_path(code) is not None
+
+
+@pytest.mark.parametrize("code", [
+    # 只读/查询敏感路径 — 不得误伤
+    'import pandas as pd\npd.read_csv("/root/.ssh/config.csv")',
+    'import numpy as np\nnp.load("/root/.hermes/data.npy")',
+    'import os\nprint(os.path.exists("/root/.ssh"))',
+    'import os\nprint(os.path.join("/root/.ssh", "x"))',
+    'from pathlib import Path\nprint(Path("/root/.hermes").exists())',
+    'import glob\nprint(glob.glob("/root/.ssh/*"))',
+    'import json\nprint(json.load(open("/root/.hermes/config.json")))',
+    'print(open("/etc/hosts").read())',
+    # 普通路径写 — 不属于敏感不变量（危险面由 AST-dangerous-ops 单独管辖）
+    'import pandas as pd\npd.DataFrame({"a": [1]}).to_csv("/tmp/ok.csv")',
+])
+def test_library_readonly_sensitive_path_passes(code):
+    """只读/查询方法携带敏感路径参数必须放行（与 open() 只读行为一致）。"""
+    assert _execute_code_touches_sensitive_path(code) is None
+
+
+@pytest.mark.parametrize("mode_gate", ["normal", "yolo", "off"])
+def test_library_writer_sensitive_hard_blocked_in_all_modes(monkeypatch, mode_gate):
+    """库写方法敏感路径在 yolo/approvals=off 下同样不可覆盖（#49578 不变量）。"""
+    code = ('import pandas as pd\n'
+            'pd.DataFrame({"a": [1]}).to_csv("/root/.ssh/authorized_keys")')
+
+    import tools.approval as approval_module
+    if mode_gate == "yolo":
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    elif mode_gate == "off":
+        monkeypatch.setattr(
+            approval_module, "_get_approval_mode", lambda: "off"
+        )
+
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["approved"] is False
+    assert result["outcome"] == "hard_blocked"
+    assert "protected path" in result["message"]
+
+
+def test_library_writer_guard_returns_hard_blocked_outcome():
+    """guard 集成：CLI 路径下库写敏感返回 hard_blocked（复现用例）。"""
+    result = check_execute_code_guard(
+        'import pandas as pd\npd.DataFrame({"a": [1]}).to_csv("/root/.ssh/authorized_keys")',
+        env_type="local",
+    )
+    assert result["approved"] is False
+    assert result["outcome"] == "hard_blocked"

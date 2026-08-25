@@ -5448,6 +5448,7 @@ from tools.exec_code_policy import (
     _execute_code_has_dangerous_ops,
     _execute_code_has_self_destructive_ops,
     _execute_code_has_sensitive_write,
+    _execute_code_touches_sensitive_path,
     _exec_code_reason_text,
     _log_blocked_exec_code,
 )
@@ -5526,6 +5527,36 @@ def check_execute_code_guard(code: str, env_type: str,
             "description": (
                 "execute_code write to protected sensitive path (hard blocked — "
                 "destination invariant #49578)"
+            ),
+            "outcome": "hard_blocked",
+            "user_consent": False,
+        }
+
+    # ── Layer 4b: Library-writer sensitive-path invariant (#49578 残余面) ──
+    # pandas/numpy 等库写方法（to_csv/save/dump/...）的路径参数绕过
+    # open()/Path() AST 形状（2026-08-26 复现：
+    # pd.DataFrame(...).to_csv('/root/.ssh/authorized_keys') 曾直接放行）。
+    # 任何非只读方法调用携带静态可解析的敏感路径参数 → 同样 hard-block，
+    # 与上面的目标不变量共用同一优先级（yolo/off 不可覆盖）。
+    _library_sensitive_target = _execute_code_touches_sensitive_path(code)
+    if _library_sensitive_target is not None:
+        return {
+            "approved": False,
+            "message": (
+                f"HARD BLOCKED: execute_code library call references protected "
+                f"path {_library_sensitive_target!r}. "
+                "This destination is security-sensitive (Hermes config, "
+                "~/.ssh, or system path) and is hard-refused by the file-tool "
+                "path regardless of approval mode (#49578). There is no "
+                "approval path, bypass, or override for a statically matched "
+                "sensitive reference — not even under --yolo or "
+                "approvals.mode=off. Use normal tool calls (read_file, "
+                "write_file, terminal) for this path instead."
+            ),
+            "pattern_key": "execute_code",
+            "description": (
+                "execute_code library call on protected sensitive path (hard "
+                "blocked — destination invariant #49578)"
             ),
             "outcome": "hard_blocked",
             "user_consent": False,
