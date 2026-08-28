@@ -814,6 +814,158 @@ def test_pathlib_mutation_non_sensitive_target_triggers_approval_not_silent():
         "from pathlib import Path\nPath('/tmp/x').unlink()\n") is None
 
 
+# ── B5. 危险伪装成安全命令（2026-08-28 拆解：问题复制拆解而非简化——
+#       每个 blocker 不只补单个形状，而是按能力类别 + 伪装面系统性闭合。
+#       修复前全部漏检/只落可恢复审批。）──
+
+# B5a. 分支 join 多候选：安全候选不得遮蔽危险候选
+BRANCH_JOIN_DANGEROUS_FIXED = [
+    ("safe-first-then-kill",
+     "import os\nkiller = os.path.join\nif cond:\n    killer = os.kill\nkiller(os.getpid(), 15)\n"),
+    ("import-alias-shadowed",
+     "import os\nfrom os import kill\nif cond:\n    kill = os.path.join\nkill(os.getpid(), 15)\n"),
+    ("chained-safe-first",
+     "import os\na = os.path\nkiller = a.join\nif cond:\n    killer = os.kill\nkiller(os.getpid(), 15)\n"),
+]
+
+@pytest.mark.parametrize("label,code", BRANCH_JOIN_DANGEROUS_FIXED,
+                         ids=[l for l, _ in BRANCH_JOIN_DANGEROUS_FIXED])
+def test_branch_join_dangerous_candidate_not_shadowed(label, code):
+    """分支 join 时任一候选是危险目标就必须硬阻断——安全候选（os.path.join）
+    出现在先/后都不得遮蔽 os.kill（修复前取第一个可解析 → 放行）。"""
+    assert _execute_code_has_self_destructive_ops(code) is not None
+
+
+def test_branch_join_dangerous_guard_end_to_end():
+    result = check_execute_code_guard(
+        "import os\nkiller = os.path.join\nif cond:\n    killer = os.kill\nkiller(os.getpid(), 15)\n",
+        env_type="local")
+    assert result["outcome"] == "hard_blocked"
+
+
+# B5b. 路径伪装：bytes / 字符串拼接 / Path 多参（目标解析必须穿透）
+PATH_DISGUISE_FIXED = [
+    ("bytes target",
+     "open(b'/root/.hermes/config.yaml', 'w').write('x')"),
+    ("string-concat target",
+     "open('/root/.hermes/' + 'config.yaml', 'w').write('x')"),
+    ("path-multiarg",
+     "from pathlib import Path\nPath('/root', '.hermes', 'config.yaml').write_text('x')"),
+    ("path-multiarg-open",
+     "from pathlib import Path\nPath('/root', '.hermes', 'config.yaml').open('w')"),
+    ("path-multiarg-unlink",
+     "from pathlib import Path\nPath('/root', '.ssh', 'authorized_keys').unlink()"),
+    ("bytes expanduser-alias",
+     "import os\nh = os.path.expanduser\nopen(h('~/.hermes/') + b'config.yaml'.decode(), 'w').write('x')"),
+]
+
+@pytest.mark.parametrize("label,code", PATH_DISGUISE_FIXED,
+                         ids=[l for l, _ in PATH_DISGUISE_FIXED])
+def test_path_disguise_sensitive_write_hard_blocked(label, code):
+    """路径伪装（bytes/拼接/多参）必须解析出敏感目标并硬阻断
+    （修复前只落可恢复 open-write 审批 → yolo 下击穿 #49578 不变量）。"""
+    assert _execute_code_has_sensitive_write(code) is not None
+
+
+@pytest.mark.parametrize("label,code", PATH_DISGUISE_FIXED[:4],
+                         ids=[l for l, _ in PATH_DISGUISE_FIXED[:4]])
+def test_path_disguise_guard_end_to_end(label, code):
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["outcome"] == "hard_blocked"
+    assert "protected path" in result["message"]
+
+
+# B5c. 能力类别补全：同能力的家族方法不得因枚举遗漏而静默放行
+CAPABILITY_FAMILY_FIXED = [
+    ("shutil.copyfile", "import shutil\nshutil.copyfile('/tmp/a', '/tmp/b')", "file-mutate"),
+    ("shutil.copyfileobj", "import shutil\nshutil.copyfileobj(open('/tmp/a','rb'), open('/tmp/b','wb'))", "file-mutate"),
+    ("shutil.copystat", "import shutil\nshutil.copystat('/tmp/a', '/tmp/b')", "file-mutate"),
+    ("os.makedirs", "import os\nos.makedirs('/tmp/x/y', exist_ok=True)", "file-mutate"),
+    ("os.mkdir", "import os\nos.mkdir('/tmp/x')", "file-mutate"),
+    ("os.rmdir", "import os\nos.rmdir('/tmp/x')", "file-delete"),
+    ("os.removedirs", "import os\nos.removedirs('/tmp/x/y')", "file-delete"),
+    ("os.chmod", "import os\nos.chmod('/tmp/x', 0o644)", "file-mutate"),
+    ("os.chown", "import os\nos.chown('/tmp/x', 0, 0)", "file-mutate"),
+    ("os.utime", "import os\nos.utime('/tmp/x', None)", "file-mutate"),
+    ("os.truncate", "import os\nos.truncate('/tmp/x', 0)", "file-mutate"),
+    ("os.link", "import os\nos.link('/tmp/a', '/tmp/b')", "file-mutate"),
+    ("os.symlink", "import os\nos.symlink('/tmp/a', '/tmp/b')", "file-mutate"),
+    ("os.spawnl", "import os\nos.spawnl(os.P_NOWAIT, '/bin/sh', 'sh', '-c', 'id')", "command-exec"),
+    ("os.spawnv", "import os\nos.spawnv(os.P_NOWAIT, '/bin/sh', ['sh', '-c', 'id'])", "command-exec"),
+    ("subprocess.getoutput", "import subprocess\nsubprocess.getoutput('id')", "command-exec"),
+    ("subprocess.getstatusoutput", "import subprocess\nsubprocess.getstatusoutput('id')", "command-exec"),
+]
+
+@pytest.mark.parametrize("label,code,reason", CAPABILITY_FAMILY_FIXED,
+                         ids=[l for l, _, _ in CAPABILITY_FAMILY_FIXED])
+def test_capability_family_not_silent(label, code, reason):
+    """能力类别（文件删除/文件变异/命令执行）的每个家族成员都必须触发
+    审批而非静默放行——按能力分类枚举，不依赖调用方逐个点名（修复前
+    copyfile/makedirs/spawnl/getoutput 等全部静默放行）。"""
+    assert _execute_code_has_dangerous_ops(code) == reason
+
+
+def test_capability_family_sensitive_target_hard_blocked():
+    """能力家族命中敏感目标时升级为硬阻断（yolo/off 不可覆盖）。"""
+    assert _execute_code_touches_sensitive_path(
+        "import shutil\nshutil.copyfile('/tmp/a', '/root/.ssh/authorized_keys')") is not None
+    assert _execute_code_touches_sensitive_path(
+        "import os\nos.makedirs('/root/.ssh/new')") is not None
+    result = check_execute_code_guard(
+        "import shutil\nshutil.copyfile('/tmp/a', '/root/.ssh/authorized_keys')",
+        env_type="local")
+    assert result["outcome"] == "hard_blocked"
+
+
+# ── B6. 不误伤正常操作（2026-08-28 拆解：拦截之外必须证明零误伤）──
+
+BENIGN_CAPABILITY_CONTROLS = [
+    # 多候选全安全 → 无危险
+    "import os\nk = os.path.join\nif cond:\n    k = os.path.dirname\nprint(k('a', 'b'))",
+    # bytes/拼接只读路径
+    "open(b'/etc/hostname', 'rb').read()",
+    "open('/etc/' + 'hostname', 'r').read()",
+    # Path 多参只读 / 非敏感写（写落入审批，但不触发 hard/sens）
+    "from pathlib import Path\nPath('/tmp', 'x', 'y').read_text()",
+    # psutil 查询方法（不属终止能力）
+    "import psutil\nprint(psutil.cpu_percent())",
+    "import os, psutil\np = psutil.Process(os.getpid())\nprint(p.cpu_percent(), p.memory_info(), p.status(), p.name(), p.cmdline())",
+    "import psutil\nprint(psutil.virtual_memory(), psutil.disk_usage('/'))",
+    # shutil 查询（非变异）
+    "import shutil\nprint(shutil.disk_usage('/'), shutil.which('python'))",
+    # os.path 纯查询
+    "import os\nprint(os.path.exists('/etc/passwd'), os.path.getsize('/etc/passwd'))",
+    # 敏感目录只读列举 / 读取
+    "import os\nprint(os.listdir('/etc'))",
+    "from pathlib import Path\nprint(Path('/etc/hostname').read_text())",
+    "print(open('/etc/hostname', 'r').read())",
+    "from pathlib import Path\nlist(Path('/etc').iterdir())",
+    # subprocess 模块本身（无调用）
+    "import subprocess\nprint(subprocess.__version__)",
+]
+
+@pytest.mark.parametrize("code", BENIGN_CAPABILITY_CONTROLS)
+def test_capability_benign_no_false_positive(code):
+    """每个新能力的正常使用不得触发 hard_blocked / sensitive-write /
+    touches-sensitive-path（查询、只读、非敏感目标、无害别名）。"""
+    assert _execute_code_has_self_destructive_ops(code) is None
+    assert _execute_code_has_sensitive_write(code) is None
+    assert _execute_code_touches_sensitive_path(code) is None
+
+
+def test_capability_benign_non_sensitive_mutation_prompts_not_silent():
+    """非敏感目标的变异操作：不硬阻断（不误伤），但必须触发审批而非
+    静默放行（与 os.remove 同级——阿锋：拦截之外还要防静默）。"""
+    for code, reason in [
+        ("import shutil\nshutil.copyfile('/tmp/a', '/tmp/b')", "file-mutate"),
+        ("import os\nos.makedirs('/tmp/x/y', exist_ok=True)", "file-mutate"),
+        ("import os\nos.chmod('/tmp/x', 0o644)", "file-mutate"),
+        ("from pathlib import Path\nPath('/tmp/x').write_text('d')", "open-write"),
+    ]:
+        assert _execute_code_has_dangerous_ops(code) == reason
+        assert _execute_code_has_sensitive_write(code) is None
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # Section C — 无法静态修复的残余面（XFAIL 标注，文档化）
 # 属于 sandbox/运行时边界的职责（模块 docstring 已诚实声明）：
