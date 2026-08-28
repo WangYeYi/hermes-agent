@@ -37,25 +37,63 @@ logger = logging.getLogger(__name__)
 # caught.  ctypes is listed as a whole-module gate. reason key 见
 # _EXEC_CODE_DANGER_DETAILS。
 _EXEC_CODE_DANGEROUS_CALLS = {
-    # 文件/目录删除
+    # ── 能力类别 1：文件/目录删除 ─────────────────────────────
     ("os", "remove"): "file-delete",
     ("os", "unlink"): "file-delete",
+    ("os", "rmdir"): "file-delete",
+    ("os", "removedirs"): "file-delete",
     ("shutil", "rmtree"): "file-delete",
-    # 文件移动/复制/重命名（config write bypass, #49578）
+    ("pathlib", "unlink"): "file-delete",
+    ("pathlib", "rmdir"): "file-delete",
+    # ── 能力类别 2：文件移动/复制/重命名/创建（#49578 config write 面）──
     ("shutil", "copy"): "file-mutate",
     ("shutil", "copy2"): "file-mutate",
-    ("shutil", "move"): "file-mutate",
+    ("shutil", "copyfile"): "file-mutate",
+    ("shutil", "copyfileobj"): "file-mutate",
     ("shutil", "copytree"): "file-mutate",
+    ("shutil", "move"): "file-mutate",
+    ("shutil", "copystat"): "file-mutate",
     ("os", "rename"): "file-mutate",
     ("os", "replace"): "file-mutate",
-    # 任意命令执行（绕过 terminal() DANGEROUS_PATTERNS）
+    ("os", "link"): "file-mutate",
+    ("os", "symlink"): "file-mutate",
+    ("os", "mkdir"): "file-mutate",
+    ("os", "makedirs"): "file-mutate",
+    ("os", "mkfifo"): "file-mutate",
+    ("os", "mknod"): "file-mutate",
+    # 文件属性/内容篡改（无参数路径的 receiver 或目标参数均可达敏感区）
+    ("os", "chmod"): "file-mutate",
+    ("os", "chown"): "file-mutate",
+    ("os", "lchmod"): "file-mutate",
+    ("os", "lchown"): "file-mutate",
+    ("os", "utime"): "file-mutate",
+    ("os", "truncate"): "file-mutate",
+    ("pathlib", "touch"): "file-mutate",
+    ("pathlib", "chmod"): "file-mutate",
+    ("pathlib", "chown"): "file-mutate",
+    ("pathlib", "rename"): "file-mutate",
+    ("pathlib", "replace"): "file-mutate",
+    ("pathlib", "mkdir"): "file-mutate",
+    ("pathlib", "symlink_to"): "file-mutate",
+    ("pathlib", "hardlink_to"): "file-mutate",
+    # ── 能力类别 3：任意命令执行（绕过 terminal() DANGEROUS_PATTERNS）──
     ("os", "system"): "command-exec",
     ("os", "popen"): "command-exec",
+    ("os", "spawnl"): "command-exec",
+    ("os", "spawnle"): "command-exec",
+    ("os", "spawnlp"): "command-exec",
+    ("os", "spawnlpe"): "command-exec",
+    ("os", "spawnv"): "command-exec",
+    ("os", "spawnve"): "command-exec",
+    ("os", "spawnvp"): "command-exec",
+    ("os", "spawnvpe"): "command-exec",
     ("subprocess", "run"): "command-exec",
     ("subprocess", "call"): "command-exec",
     ("subprocess", "Popen"): "command-exec",
     ("subprocess", "check_output"): "command-exec",
     ("subprocess", "check_call"): "command-exec",
+    ("subprocess", "getoutput"): "command-exec",
+    ("subprocess", "getstatusoutput"): "command-exec",
     # 进程替换（exec* 系列）——脚本把自己换成本机程序，绕过后续全部
     # Python 级检查（#65592 review 举一反三补充）
     ("os", "execv"): "command-exec",
@@ -68,23 +106,10 @@ _EXEC_CODE_DANGEROUS_CALLS = {
     ("os", "execlpe"): "command-exec",
     ("os", "posix_spawn"): "command-exec",
     ("os", "posix_spawnp"): "command-exec",
-    # pathlib 写方法（#49578 的等效绕过面，review 点名 Path.write_text）
+    # ── 能力类别 4：文件内容写入（pathlib，#49578 等效面）──
     ("pathlib", "write_text"): "open-write",
     ("pathlib", "write_bytes"): "open-write",
     ("pathlib", "open"): "open-write",
-    # pathlib 变异方法（2026-08-25 re-review Blocker 3a：receiver-bound
-    # mutations——Path(...).unlink()/touch()/chmod() 无路径参数，曾完全
-    # 漏检）。与 os.unlink/os.rename 同能力，归入同类 reason。
-    ("pathlib", "unlink"): "file-delete",
-    ("pathlib", "rmdir"): "file-delete",
-    ("pathlib", "touch"): "file-mutate",
-    ("pathlib", "chmod"): "file-mutate",
-    ("pathlib", "chown"): "file-mutate",
-    ("pathlib", "rename"): "file-mutate",
-    ("pathlib", "replace"): "file-mutate",
-    ("pathlib", "mkdir"): "file-mutate",
-    ("pathlib", "symlink_to"): "file-mutate",
-    ("pathlib", "hardlink_to"): "file-mutate",
 }
 
 # 模块的整体导入即触发 guard（即使不调用具体函数）。ctypes 符合——
@@ -140,7 +165,7 @@ _HARD_BLOCKED_CALLS = frozenset({
 })
 
 
-def _resolve_binding_expr(expr, imports, raw_aliases, seen=None):
+def _resolve_binding_expr(expr, imports, raw_aliases, seen=None, known=None):
     """解析赋值 RHS 表达式为规范化的 (module, attr) 元组。
 
     2026-08-25 复测重构（#65592）：原 _resolve_alias_value 只收 name 字符串，
@@ -159,6 +184,13 @@ def _resolve_binding_expr(expr, imports, raw_aliases, seen=None):
       - ``k = partial(os.kill, 1, 15)`` → ('os', 'kill')
       - ``k = __import__('os')`` → ('os', None)
     解析不了返回 None（调用方决定是否保守拦截）。
+
+    ``known``（可选）：危险目标集合。同名字多次赋值保留全部候选时，
+    **危险优先**——任一候选解析结果命中 ``known`` 即返回该结果（而非
+    取第一个可解析），保证 ``killer = os.path.join; if c: killer =
+    os.kill`` 这类分支 join 形状不会被安全候选遮蔽危险候选
+    （2026-08-28 拆解：review Blocker 1 要求 conservatively retain
+    every possible dangerous target）。known 为 None 时维持第一个可解析。
     """
     if seen is None:
         seen = set()
@@ -166,7 +198,7 @@ def _resolve_binding_expr(expr, imports, raw_aliases, seen=None):
     # (k := os.kill) — walrus 表达式本身（2026-08-25 复测：NamedExpr 不是
     # Assign，整个逃出绑定图 → (k := os.kill)(1, 15) 曾直接放行）
     if isinstance(expr, ast.NamedExpr):
-        return _resolve_binding_expr(expr.value, imports, raw_aliases, seen)
+        return _resolve_binding_expr(expr.value, imports, raw_aliases, seen, known)
 
     # a = b（别名链）/ a = os（模块级别名）
     if isinstance(expr, ast.Name):
@@ -179,10 +211,23 @@ def _resolve_binding_expr(expr, imports, raw_aliases, seen=None):
         seen.add(expr.id)
         if expr.id in raw_aliases:
             # 同名多次赋值保留全部候选（review Blocker 1：分支 join 时
-            # 任一候选都可能生效）。取第一个可解析候选——保守方向：任一
-            # 候选危险即拦截，任一候选是模块即保持模块身份。
-            for cand in raw_aliases[expr.id]:
-                resolved = _resolve_binding_expr(cand, imports, raw_aliases, seen)
+            # 任一候选都可能生效）。**危险优先**（2026-08-28 拆解）：
+            # 先扫描全部候选，任一命中 known 危险集合即返回——防止
+            # ``killer = os.path.join; if c: killer = os.kill`` 中安全
+            # 候选遮蔽危险候选；全部候选都不危险时才取第一个可解析。
+            # known 扫描用 seen 副本：builtins 命中不在 known 集合（如
+            # ("builtins","open") 不属 DANGEROUS_CALLS 键）时，不能把
+            # 别名链上的名字污染进 seen 导致 fallback 短路（f = open;
+            # g = f; g(...) 曾因此返回 None）。
+            cands = raw_aliases[expr.id]
+            if known:
+                for cand in cands:
+                    resolved = _resolve_binding_expr(
+                        cand, imports, raw_aliases, set(seen), known)
+                    if resolved is not None and resolved in known:
+                        return resolved
+            for cand in cands:
+                resolved = _resolve_binding_expr(cand, imports, raw_aliases, seen, known)
                 if resolved is not None:
                     return resolved
         return None
@@ -193,7 +238,7 @@ def _resolve_binding_expr(expr, imports, raw_aliases, seen=None):
         if expr.value.id in imports:
             base = imports[expr.value.id]
         else:
-            base = _resolve_binding_expr(expr.value, imports, raw_aliases, seen)
+            base = _resolve_binding_expr(expr.value, imports, raw_aliases, seen, known)
         if base:
             m, a = base
             # 组合属性链（2026-08-25 re-review）：base 已带属性时（如
@@ -213,7 +258,7 @@ def _resolve_binding_expr(expr, imports, raw_aliases, seen=None):
                 and imports[inner.value.id][0] == "os"):
             return ("os.path", expr.attr)
         if (inner.attr == "path" and isinstance(inner.value, ast.Name)
-                and _resolve_binding_expr(inner.value, imports, raw_aliases, seen)
+                and _resolve_binding_expr(inner.value, imports, raw_aliases, seen, known)
                 == ("os", None)):
             return ("os.path", expr.attr)
 
@@ -226,7 +271,7 @@ def _resolve_binding_expr(expr, imports, raw_aliases, seen=None):
             if obj_expr.id in imports:
                 m = imports[obj_expr.id][0]
             else:
-                base = _resolve_binding_expr(obj_expr, imports, raw_aliases, seen)
+                base = _resolve_binding_expr(obj_expr, imports, raw_aliases, seen, known)
                 if base:
                     m = base[0]
             if m is not None:
@@ -239,9 +284,9 @@ def _resolve_binding_expr(expr, imports, raw_aliases, seen=None):
     # k = partial(os.kill, 1, 15) — functools.partial 首参即被调用目标
     # （2026-08-25 复测举一反三：partial 包装曾完全逃过解析）
     if (isinstance(expr, ast.Call) and expr.args
-            and _resolve_binding_expr(expr.func, imports, raw_aliases, seen)
+            and _resolve_binding_expr(expr.func, imports, raw_aliases, seen, known)
             in (("functools", "partial"), ("builtins", "partial"))):
-        return _resolve_binding_expr(expr.args[0], imports, raw_aliases, seen)
+        return _resolve_binding_expr(expr.args[0], imports, raw_aliases, seen, known)
 
     # k = __import__('os') — 返回模块对象
     if (isinstance(expr, ast.Call) and getattr(expr.func, "id", None) == "__import__"
@@ -253,7 +298,7 @@ def _resolve_binding_expr(expr, imports, raw_aliases, seen=None):
     #     x = [os.kill][0] / x = sys.modules['os'] / x = globals()['os'] /
     #     x = vars(os)['kill'] — 下标取值形状
     if isinstance(expr, ast.Subscript):
-        return _resolve_subscript_expr(expr, imports, raw_aliases, seen)
+        return _resolve_subscript_expr(expr, imports, raw_aliases, seen, known)
     return None
 
 
@@ -302,7 +347,7 @@ def _getattr_args(call_node):
     return obj_expr, attr_expr
 
 
-def _resolve_subscript_expr(expr, imports, raw_aliases, seen=None):
+def _resolve_subscript_expr(expr, imports, raw_aliases, seen=None, known=None):
     """解析下标表达式 x[slice] 为规范化的 (module, attr)（调用位与赋值 RHS 共用）。
 
     覆盖（2026-08-25 复测举一反三）：
@@ -324,7 +369,7 @@ def _resolve_subscript_expr(expr, imports, raw_aliases, seen=None):
         if val.value.id in imports:
             m = imports[val.value.id][0]
         else:
-            base = _resolve_binding_expr(val.value, imports, raw_aliases, seen)
+            base = _resolve_binding_expr(val.value, imports, raw_aliases, seen, known)
             if base:
                 m = base[0]
         if m is not None and slice_str is not None:
@@ -334,14 +379,14 @@ def _resolve_subscript_expr(expr, imports, raw_aliases, seen=None):
         for key_n, value_n in zip(val.keys, val.values):
             key_s = _fold_str_expr(key_n, raw_aliases)
             if key_s is not None and key_s == slice_str:
-                return _resolve_binding_expr(value_n, imports, raw_aliases, seen)
+                return _resolve_binding_expr(value_n, imports, raw_aliases, seen, known)
     # [os.kill][0] / (os.kill,)[0] — list/tuple 字面量（slice 为整型常量）
     if (isinstance(val, (ast.List, ast.Tuple))
             and isinstance(expr.slice, ast.Constant)
             and isinstance(expr.slice.value, int)):
         idx = expr.slice.value
         if 0 <= idx < len(val.elts):
-            return _resolve_binding_expr(val.elts[idx], imports, raw_aliases, seen)
+            return _resolve_binding_expr(val.elts[idx], imports, raw_aliases, seen, known)
     # sys.modules['os'] — 模块表查询（折叠后字符串 → 该模块）
     if (isinstance(val, ast.Attribute) and val.attr == "modules"
             and isinstance(val.value, ast.Name)
@@ -361,7 +406,7 @@ def _resolve_subscript_expr(expr, imports, raw_aliases, seen=None):
         if val.args[0].id in imports:
             m = imports[val.args[0].id][0]
         else:
-            base = _resolve_binding_expr(val.args[0], imports, raw_aliases, seen)
+            base = _resolve_binding_expr(val.args[0], imports, raw_aliases, seen, known)
             if base:
                 m = base[0]
         if m is not None and slice_str is not None:
@@ -369,7 +414,7 @@ def _resolve_subscript_expr(expr, imports, raw_aliases, seen=None):
     return None
 
 
-def _resolve_alias_value(name, imports, raw_aliases, seen=None):
+def _resolve_alias_value(name, imports, raw_aliases, seen=None, known=None):
     """解析赋值别名链为规范化的 (module, attr) 元组（name 字符串入口）。
 
     直接调用（open(...)）与别名 RHS（op = open）都先检查 builtin 名；
@@ -384,14 +429,23 @@ def _resolve_alias_value(name, imports, raw_aliases, seen=None):
     if name in seen:
         return None  # 循环别名（a=b; b=a）— 放弃，保守不误报
     seen.add(name)
-    for cand in raw_aliases[name]:
-        resolved = _resolve_binding_expr(cand, imports, raw_aliases, seen)
+    cands = raw_aliases[name]
+    # 危险优先（2026-08-28 拆解）：任一候选命中 known 即返回，防止
+    # 安全候选遮蔽危险候选（killer = os.path.join; if c: killer = os.kill）。
+    # known 扫描用 seen 副本，避免污染 fallback（同 _resolve_binding_expr）。
+    if known:
+        for cand in cands:
+            resolved = _resolve_binding_expr(cand, imports, raw_aliases, set(seen), known)
+            if resolved is not None and resolved in known:
+                return resolved
+    for cand in cands:
+        resolved = _resolve_binding_expr(cand, imports, raw_aliases, seen, known)
         if resolved is not None:
             return resolved
     return None
 
 
-def _resolve_attribute_chain(expr, imports, raw_aliases, seen=None):
+def _resolve_attribute_chain(expr, imports, raw_aliases, seen=None, known=None):
     """把嵌套属性表达式解析为规范化 (module, attr)。
 
     2026-08-25 re-review 补充：``os.path.expanduser`` 的 func 是三层
@@ -403,9 +457,9 @@ def _resolve_attribute_chain(expr, imports, raw_aliases, seen=None):
     if isinstance(expr, ast.Name):
         if expr.id in imports:
             return imports[expr.id]
-        return _resolve_alias_value(expr.id, imports, raw_aliases, seen)
+        return _resolve_alias_value(expr.id, imports, raw_aliases, seen, known)
     if isinstance(expr, ast.Attribute):
-        base = _resolve_attribute_chain(expr.value, imports, raw_aliases, seen)
+        base = _resolve_attribute_chain(expr.value, imports, raw_aliases, seen, known)
         if base:
             m, a = base
             if a is None:
@@ -630,7 +684,15 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
     # ── ast.Name: kill(...) ──
     if isinstance(func, ast.Name):
         name = func.id
-        alias = _resolve_alias_value(name, imports, raw_aliases)
+        # imports 绑定也是候选（2026-08-28 拆解：``from os import kill;
+        # if cond: kill = os.path.join; kill(...)`` 的 kill 同时有 import
+        # 绑定 ("os","kill") 和赋值候选 os.path.join——先查 imports 危险
+        # 命中，防止赋值别名把 import 危险绑定遮蔽掉）。
+        if name in imports:
+            m, a = imports[name]
+            if a is not None and (m, a) in known:
+                return (m, a)
+        alias = _resolve_alias_value(name, imports, raw_aliases, None, known)
         if alias is not None:
             return alias
         if name in imports:
@@ -658,11 +720,13 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
             else:
                 # 赋值别名：killer = os.kill 的 base 是 os；o.kill 的 base 是 o；
                 # p.expanduser 的 base 是 p（p = os.path，组合属性）
-                resolved_base = _resolve_alias_value(base.id, imports, raw_aliases)
+                resolved_base = _resolve_alias_value(
+                    base.id, imports, raw_aliases, None, known)
         elif isinstance(base, ast.Attribute):
             # 嵌套属性 base：os.path.expanduser 的 base 是 os.path
             # （2026-08-25 re-review：此前只认 Name base，直接 return None）
-            resolved_base = _resolve_attribute_chain(base, imports, raw_aliases)
+            resolved_base = _resolve_attribute_chain(
+                base, imports, raw_aliases, None, known)
         elif isinstance(base, ast.Call):
             # psutil.Process(1).kill() — 实例方法链（2026-08-25 复测：
             # psutil.Process(...).kill() 曾完全逃逸）。base 是可调用构造，
@@ -672,14 +736,17 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
             if inner is not None and inner[0] == "psutil":
                 return ("psutil", attr)
             # __import__('os').kill(...) — base 是模块导入调用
-            resolved_base = _resolve_binding_expr(base, imports, raw_aliases)
+            resolved_base = _resolve_binding_expr(
+                base, imports, raw_aliases, None, known)
         elif isinstance(base, ast.Subscript):
             # sys.modules['os'].kill(...) / vars(os)['kill'](...) /
             # {'kill': os.kill}['kill'](...) — base 是下标取值
-            resolved_base = _resolve_binding_expr(base, imports, raw_aliases)
+            resolved_base = _resolve_binding_expr(
+                base, imports, raw_aliases, None, known)
         elif isinstance(base, ast.NamedExpr):
             # (k := os).kill(...) — walrus base
-            resolved_base = _resolve_binding_expr(base, imports, raw_aliases)
+            resolved_base = _resolve_binding_expr(
+                base, imports, raw_aliases, None, known)
         if resolved_base is not None:
             m, a = resolved_base
             # 组合属性链：o = os.path 后 o.expanduser(...) 必须解析成
@@ -700,7 +767,8 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
                 if obj_expr.id in imports:
                     m = imports[obj_expr.id][0]
                 else:
-                    alias = _resolve_alias_value(obj_expr.id, imports, raw_aliases)
+                    alias = _resolve_alias_value(
+                        obj_expr.id, imports, raw_aliases, None, known)
                     if alias is not None:
                         m = alias[0]
                 if m is not None:
@@ -723,7 +791,8 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
                     if base.value.id in imports:
                         m = imports[base.value.id][0]
                     else:
-                        alias = _resolve_alias_value(base.value.id, imports, raw_aliases)
+                        alias = _resolve_alias_value(
+                            base.value.id, imports, raw_aliases, None, known)
                         if alias is not None:
                             m = alias[0]
                     if m is not None:
@@ -733,12 +802,15 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
                     for key_n, value_n in zip(base.keys, base.values):
                         if (isinstance(key_n, ast.Constant)
                                 and key_n.value == key):
-                            return _resolve_binding_expr(value_n, imports, raw_aliases)
+                            return _resolve_binding_expr(
+                                value_n, imports, raw_aliases, None, known)
             return None
         # partial(os.kill, 1, 15)(...) — functools.partial 首参即被调用目标
-        if (func.args and _resolve_binding_expr(func.func, imports, raw_aliases)
+        if (func.args and _resolve_binding_expr(
+                func.func, imports, raw_aliases, None, known)
                 in (("functools", "partial"), ("builtins", "partial"))):
-            return _resolve_binding_expr(func.args[0], imports, raw_aliases)
+            return _resolve_binding_expr(
+                func.args[0], imports, raw_aliases, None, known)
         return None
 
     # ── ast.Subscript: os.__dict__['kill'](...) / o.__dict__['kill'](...) /
@@ -748,7 +820,7 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
     #   全家族覆盖：__dict__、dict/list 字面量、sys.modules、globals()、
     #   vars()；调用位与赋值 RHS 共用同一解析）
     if isinstance(func, ast.Subscript):
-        return _resolve_subscript_expr(func, imports, raw_aliases)
+        return _resolve_subscript_expr(func, imports, raw_aliases, None, known)
 
     return None
 
@@ -1075,6 +1147,33 @@ def _resolve_expr_path(expr, raw_aliases, imports) -> str | None:
     """
     if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
         return expr.value
+    # bytes 字面量（2026-08-28 拆解伪装面：``open(b"/root/.hermes/config.yaml",
+    # "w")`` 的路径是 bytes 而非 str，曾完全漏过目标解析 → 只落可恢复审批）
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, bytes):
+        try:
+            return expr.value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    # 字符串拼接 BinOp（2026-08-28 拆解伪装面：``open("/root/.hermes/" +
+    # "config.yaml", "w")`` 是 BinOp Add，曾漏过 → 只落可恢复审批）。
+    # 与 _fold_str_expr 同语义：左右两侧都是静态可解析字符串才折叠。
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        left = _resolve_expr_path(expr.left, raw_aliases, imports)
+        right = _resolve_expr_path(expr.right, raw_aliases, imports)
+        if isinstance(left, str) and isinstance(right, str):
+            return left + right
+        return None
+    # bytes.decode() 方法调用（2026-08-28 拆解伪装面：
+    # ``b'config.yaml'.decode()`` 是 bytes→str 常见转换，静态可解析）。
+    if (isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute)
+            and expr.func.attr == "decode"
+            and isinstance(expr.func.value, ast.Constant)
+            and isinstance(expr.func.value.value, bytes)
+            and not expr.args):
+        try:
+            return expr.func.value.value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
     # f-string（2026-08-25 复测：#49578 不变量曾漏掉——f'/root/.hermes/...'
     # 是 JoinedStr，不是 Constant；全字面量/可解析插值拼接，否则视为运行时）
     if isinstance(expr, ast.JoinedStr):
@@ -1155,6 +1254,26 @@ def _resolve_static_write_target(node: ast.Call, raw_aliases, imports) -> str | 
     return _resolve_expr_path(node.args[0], raw_aliases, imports)
 
 
+def _resolve_path_ctor_target(ctor: ast.Call, raw_aliases, imports) -> str | None:
+    """Path 构造调用的完整目标：``Path("/root", ".hermes", "config.yaml")``
+    的路径是全部参数按 posixpath.join 拼接（2026-08-28 拆解伪装面：
+    之前只取 args[0]，多参构造的敏感路径被截断 → 只落可恢复审批）。
+    任一参数静态不可解析 → 返回 None（保守降级，不误报）。
+    """
+    if not ctor.args:
+        return None
+    parts = []
+    for a in ctor.args:
+        r = _resolve_expr_path(a, raw_aliases, imports)
+        if isinstance(r, str):
+            parts.append(r)
+        else:
+            return None
+    if len(parts) == 1:
+        return parts[0]
+    return posixpath.join(*parts)
+
+
 def _write_target_is_sensitive(path: str) -> bool:
     """True if *path* targets a protected destination (mirrors the file-tool
     sensitive-path invariant from #49578)."""
@@ -1229,7 +1348,7 @@ def _execute_code_has_sensitive_write(code: str) -> str | None:
                 continue
             ctor = _resolve_path_constructor(func.value, raw_aliases, imports)
             if ctor is not None and ctor.args:
-                target = _resolve_expr_path(ctor.args[0], raw_aliases, imports)
+                target = _resolve_path_ctor_target(ctor, raw_aliases, imports)
                 if target and _write_target_is_sensitive(target):
                     return target
         elif resolved == ("pathlib", "open"):
@@ -1238,7 +1357,7 @@ def _execute_code_has_sensitive_write(code: str) -> str | None:
                     continue
                 ctor = _resolve_path_constructor(func.value, raw_aliases, imports)
                 if ctor is not None and ctor.args:
-                    target = _resolve_expr_path(ctor.args[0], raw_aliases, imports)
+                    target = _resolve_path_ctor_target(ctor, raw_aliases, imports)
                     if target and _write_target_is_sensitive(target):
                         return target
         # receiver-bound mutations（2026-08-25 re-review Blocker 3a）：
@@ -1253,7 +1372,7 @@ def _execute_code_has_sensitive_write(code: str) -> str | None:
                 continue
             ctor = _resolve_path_constructor(func.value, raw_aliases, imports)
             if ctor is not None and ctor.args:
-                target = _resolve_expr_path(ctor.args[0], raw_aliases, imports)
+                target = _resolve_path_ctor_target(ctor, raw_aliases, imports)
                 if target and _write_target_is_sensitive(target):
                     return target
     return None
