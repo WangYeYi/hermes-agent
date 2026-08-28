@@ -672,6 +672,148 @@ def test_normal_output_containing_blocked_word_not_halted():
     assert _tool_results_contain_user_blocked(msgs) is False
 
 
+# ── B4. andrexibiza re-review（head ead8c83cc2，2026-08-25T10:47）——
+#      Blocker 1 作用域/控制流盲 + Blocker 2 psutil 终止能力 +
+#      Blocker 3 receiver-bound 变异 / 容器误报。修复前全部 auto-approve。──
+
+# B4a. 嵌套作用域不得污染模块级绑定
+NESTED_SCOPE_BINDING_FIXED = [
+    ("nested import shadow",
+     "import os\n\ndef shadow():\n    import math as os\n\nos.kill(os.getpid(), 15)\n"),
+    ("nested import shadow guard-visible",
+     "import os\n\ndef shadow():\n    import math as os\n\nos.kill(os.getpid(), 15)\n"),
+]
+
+@ pytest.mark.parametrize("label,code", NESTED_SCOPE_BINDING_FIXED,
+                          ids=[l for l, _ in NESTED_SCOPE_BINDING_FIXED])
+def test_nested_scope_import_does_not_pollute_module_binding(label, code):
+    """函数体内 ``import math as os`` 不得覆盖模块级 ``import os``——
+    顶层 os.kill 必须仍解析为 ('os','kill') 并硬阻断（修复前放行）。"""
+    assert _execute_code_has_self_destructive_ops(code) is not None
+
+
+def test_nested_scope_import_fixed_guard_end_to_end():
+    result = check_execute_code_guard(
+        "import os\n\ndef shadow():\n    import math as os\n\nos.kill(os.getpid(), 15)\n",
+        env_type="local",
+    )
+    assert result["outcome"] == "hard_blocked"
+
+
+# B4b. 死分支赋值不得覆盖可达的危险绑定
+DEAD_BRANCH_BINDING_FIXED = [
+    ("if False overwrite",
+     "import os\nkiller = os.kill\nif False:\n    killer = print\nkiller(os.getpid(), 15)\n"),
+    ("if False overwrite star",
+     "import os\nfrom os import kill\nif False:\n    kill = print\nkill(os.getpid(), 15)\n"),
+]
+
+@ pytest.mark.parametrize("label,code", DEAD_BRANCH_BINDING_FIXED,
+                          ids=[l for l, _ in DEAD_BRANCH_BINDING_FIXED])
+def test_dead_branch_assignment_does_not_shadow_reachable_binding(label, code):
+    """不可达分支的赋值（if False: killer = print）不得覆盖可达的
+    killer = os.kill——调用点必须保留危险身份（修复前放行）。"""
+    assert _execute_code_has_self_destructive_ops(code) is not None
+
+
+def test_dead_branch_binding_fixed_guard_end_to_end():
+    result = check_execute_code_guard(
+        "import os\nkiller = os.kill\nif False:\n    killer = print\nkiller(os.getpid(), 15)\n",
+        env_type="local",
+    )
+    assert result["outcome"] == "hard_blocked"
+
+
+# B4c. psutil.Process 进程终止能力（terminate/send_signal/suspend）
+PSUTIL_PROCESS_TERMINATE_FIXED = [
+    ("terminate", "import os\nimport psutil\npsutil.Process(os.getppid()).terminate()\n"),
+    ("send_signal", "import os\nimport signal\nimport psutil\npsutil.Process(os.getppid()).send_signal(signal.SIGKILL)\n"),
+    ("suspend", "import os\nimport psutil\npsutil.Process(os.getppid()).suspend()\n"),
+]
+
+@ pytest.mark.parametrize("label,code", PSUTIL_PROCESS_TERMINATE_FIXED,
+                          ids=[l for l, _ in PSUTIL_PROCESS_TERMINATE_FIXED])
+def test_psutil_process_terminate_capability_hard_blocked(label, code):
+    """按进程终止能力定义硬阻断，而非单个方法名 kill——terminate()/
+    send_signal()/suspend() 可终止/冻结 Hermes 父进程（修复前放行）。"""
+    assert _execute_code_has_self_destructive_ops(code) is not None
+
+
+@ pytest.mark.parametrize("label,code", PSUTIL_PROCESS_TERMINATE_FIXED,
+                          ids=[l + "-guard" for l, _ in PSUTIL_PROCESS_TERMINATE_FIXED])
+def test_psutil_process_terminate_guard_end_to_end(label, code):
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["outcome"] == "hard_blocked"
+
+
+# B4d. #49578 receiver-bound 变异（目标在 receiver，无参数）
+PATHLIB_RECEIVER_MUTATION_FIXED = [
+    ("unlink", "from pathlib import Path\nPath('/root/.ssh/authorized_keys').unlink()\n"),
+    ("touch", "from pathlib import Path\nPath('/root/.hermes/config.yaml').touch()\n"),
+    ("chmod", "from pathlib import Path\nPath('/root/.hermes/config.yaml').chmod(0o644)\n"),
+    ("chown", "from pathlib import Path\nPath('/root/.hermes/config.yaml').chown(0, 0)\n"),
+    ("mkdir", "from pathlib import Path\nPath('/root/.ssh').mkdir()\n"),
+    ("symlink_to", "from pathlib import Path\nPath('/root/.ssh/newkey').symlink_to('/root/.ssh/authorized_keys')\n"),
+    ("rename receiver", "from pathlib import Path\nPath('/root/.ssh/authorized_keys').rename('/tmp/x')\n"),
+]
+
+@ pytest.mark.parametrize("label,code", PATHLIB_RECEIVER_MUTATION_FIXED,
+                          ids=[l for l, _ in PATHLIB_RECEIVER_MUTATION_FIXED])
+def test_pathlib_receiver_mutation_sensitive_hard_blocked(label, code):
+    """receiver-bound 变异（无路径参数）：目标在 Path 构造参数里，参数型
+    检测看不到——必须硬阻断（修复前 auto-approve）。"""
+    assert _execute_code_has_sensitive_write(code) is not None
+
+
+@ pytest.mark.parametrize("label,code", PATHLIB_RECEIVER_MUTATION_FIXED,
+                          ids=[l + "-guard" for l, _ in PATHLIB_RECEIVER_MUTATION_FIXED])
+def test_pathlib_receiver_mutation_guard_end_to_end(label, code):
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["outcome"] == "hard_blocked"
+
+
+@ pytest.mark.parametrize("label,code", PATHLIB_RECEIVER_MUTATION_FIXED,
+                          ids=[l + "-yolo" for l, _ in PATHLIB_RECEIVER_MUTATION_FIXED])
+def test_pathlib_receiver_mutation_hard_blocked_in_yolo(monkeypatch, label, code):
+    """yolo/approvals=off 下同样不可覆盖——receiver 变异是 #49578 目标
+    不变量的变异侧，必须在信任门之前强制执行。"""
+    import tools.approval as approval_module
+    monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["outcome"] == "hard_blocked"
+    assert "protected path" in result["message"]
+
+
+# B4e. 容器方法携带敏感字符串 ≠ 文件 I/O（误报修复）
+def test_container_append_sensitive_string_not_hard_blocked():
+    """paths.append('/etc/passwd') 只是往内存列表加字符串，无文件 I/O——
+    不得触发 protected-path 硬阻断（修复前误报）。"""
+    assert _execute_code_touches_sensitive_path(
+        "paths = []\npaths.append('/etc/passwd')\n") is None
+    assert _execute_code_touches_sensitive_path(
+        "data = {}\ndata.setdefault('/root/.hermes/config.yaml', [])\n") is None
+    assert _execute_code_touches_sensitive_path(
+        "s = '/etc/passwd'\ns.replace('passwd', 'hosts')\n") is None
+
+
+def test_pathlib_replace_dest_sensitive_still_hard_blocked():
+    """Path.replace 与 str.replace 同名——但前者是文件覆盖，目标参数
+    敏感必须硬阻断，不能因 NO_IO 白名单漏掉（同名的不同语义）。"""
+    code = "from pathlib import Path\nPath('/tmp/x').replace('/root/.ssh/authorized_keys')\n"
+    assert _execute_code_touches_sensitive_path(code) is not None
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["outcome"] == "hard_blocked"
+
+
+def test_pathlib_mutation_non_sensitive_target_triggers_approval_not_silent():
+    """非敏感目标的 Path.unlink 不是静默放行——落入 file-delete 审批
+    （与 os.remove 同级），保证删除操作永远走显式决策。"""
+    assert _execute_code_has_dangerous_ops(
+        "from pathlib import Path\nPath('/tmp/x').unlink()\n") == "file-delete"
+    assert _execute_code_has_sensitive_write(
+        "from pathlib import Path\nPath('/tmp/x').unlink()\n") is None
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # Section C — 无法静态修复的残余面（XFAIL 标注，文档化）
 # 属于 sandbox/运行时边界的职责（模块 docstring 已诚实声明）：
