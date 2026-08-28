@@ -72,6 +72,19 @@ _EXEC_CODE_DANGEROUS_CALLS = {
     ("pathlib", "write_text"): "open-write",
     ("pathlib", "write_bytes"): "open-write",
     ("pathlib", "open"): "open-write",
+    # pathlib 变异方法（2026-08-25 re-review Blocker 3a：receiver-bound
+    # mutations——Path(...).unlink()/touch()/chmod() 无路径参数，曾完全
+    # 漏检）。与 os.unlink/os.rename 同能力，归入同类 reason。
+    ("pathlib", "unlink"): "file-delete",
+    ("pathlib", "rmdir"): "file-delete",
+    ("pathlib", "touch"): "file-mutate",
+    ("pathlib", "chmod"): "file-mutate",
+    ("pathlib", "chown"): "file-mutate",
+    ("pathlib", "rename"): "file-mutate",
+    ("pathlib", "replace"): "file-mutate",
+    ("pathlib", "mkdir"): "file-mutate",
+    ("pathlib", "symlink_to"): "file-mutate",
+    ("pathlib", "hardlink_to"): "file-mutate",
 }
 
 # 模块的整体导入即触发 guard（即使不调用具体函数）。ctypes 符合——
@@ -115,6 +128,15 @@ _HARD_BLOCKED_CALLS = frozenset({
     ("signal", "kill"),
     ("signal", "pthread_kill"),
     ("psutil", "kill"),
+    # psutil.Process 进程终止能力（2026-08-25 re-review Blocker 2）：
+    # terminate()（SIGTERM）与 send_signal(SIGKILL) 是 os.kill 的
+    # 普通静态等价物，曾因 _HARD_BLOCKED_CALLS 只列 ("psutil","kill")
+    # 而全部自动放行。按进程终止能力定义硬阻断，而非单个方法名。
+    ("psutil", "terminate"),
+    ("psutil", "send_signal"),
+    # psutil.Process(...).suspend() 是 SIGSTOP——可冻结 Hermes 父进程，
+    # 同为进程控制能力（2026-08-25 举一反三）。
+    ("psutil", "suspend"),
 })
 
 
@@ -156,7 +178,13 @@ def _resolve_binding_expr(expr, imports, raw_aliases, seen=None):
             return None  # 循环别名（a=b; b=a）— 放弃，保守不误报
         seen.add(expr.id)
         if expr.id in raw_aliases:
-            return _resolve_binding_expr(raw_aliases[expr.id], imports, raw_aliases, seen)
+            # 同名多次赋值保留全部候选（review Blocker 1：分支 join 时
+            # 任一候选都可能生效）。取第一个可解析候选——保守方向：任一
+            # 候选危险即拦截，任一候选是模块即保持模块身份。
+            for cand in raw_aliases[expr.id]:
+                resolved = _resolve_binding_expr(cand, imports, raw_aliases, seen)
+                if resolved is not None:
+                    return resolved
         return None
 
     # killer = os.kill / b = a.kill / h = p.expanduser（p = os.path）
@@ -245,7 +273,10 @@ def _fold_str_expr(e, raw_aliases=None):
             return left + right
         return None
     if raw_aliases is not None and isinstance(e, ast.Name) and e.id in raw_aliases:
-        return _fold_str_expr(raw_aliases[e.id], raw_aliases)
+        for cand in raw_aliases[e.id]:
+            folded = _fold_str_expr(cand, raw_aliases)
+            if folded is not None:
+                return folded
     return None
 
 
@@ -353,7 +384,11 @@ def _resolve_alias_value(name, imports, raw_aliases, seen=None):
     if name in seen:
         return None  # 循环别名（a=b; b=a）— 放弃，保守不误报
     seen.add(name)
-    return _resolve_binding_expr(raw_aliases[name], imports, raw_aliases, seen)
+    for cand in raw_aliases[name]:
+        resolved = _resolve_binding_expr(cand, imports, raw_aliases, seen)
+        if resolved is not None:
+            return resolved
+    return None
 
 
 def _resolve_attribute_chain(expr, imports, raw_aliases, seen=None):
@@ -407,9 +442,10 @@ def _resolve_path_constructor(expr, raw_aliases, imports):
     解析不了返回 None。
     """
     if isinstance(expr, ast.Name):
-        rhs = raw_aliases.get(expr.id)
-        if rhs is not None:
-            return _resolve_path_constructor(rhs, raw_aliases, imports)
+        for cand in raw_aliases.get(expr.id, []):
+            resolved = _resolve_path_constructor(cand, raw_aliases, imports)
+            if resolved is not None:
+                return resolved
         return None
     if _expr_is_path_constructor(expr, imports, raw_aliases):
         return expr
@@ -422,14 +458,29 @@ def _collect_exec_code_bindings(code):
     返回 ``(imports, star_modules, raw_aliases)``：
       - imports:      {local_name: (module, attr_or_None)}
       - star_modules: set[str] — ``from X import *`` 的模块名集合
-      - raw_aliases:  {local_name: ast.expr} — 赋值 RHS 原始表达式，
-                      由 ``_resolve_binding_expr`` 递归解析
+      - raw_aliases:  {local_name: list[ast.expr]} — 赋值 RHS 原始表达式
+                      列表。同名多次赋值保留**全部候选**（而非
+                      last-write-wins 覆盖）——分支 join 时任一候选都可能
+                      生效，解析时任一候选命中危险目标即拦截。
 
     2026-08-25 复测扩展（#65592）——普通 Python 绑定形式补全：
       - walrus ``(k := os.kill)``（ast.NamedExpr，曾完全逃出绑定图）
       - 元组解包 ``k1, k2 = os.kill, os.killpg``（Tuple 目标按位置配对）
       - for 循环目标 ``for f in [os.kill]``（字面量可迭代时取首元素——
         第一次迭代即执行，取第一个可解析元素是正确且保守的）
+
+    2026-08-25 re-review（andrexibiza Blocker 1）——作用域与控制流修正：
+      - **嵌套作用域不污染模块级**：``def shadow(): import math as os``
+        曾覆盖顶层 ``imports[\"os\"]``，使顶层 ``os.kill(...)`` 被解析成
+        math.kill 而放行（运行时嵌套 import 不影响模块级 os）。现在
+        import 绑定记录来源深度，外层/同深度后写优先，嵌套同名不覆盖
+        模块级；但模块级无同名时嵌套绑定仍收集（防漏函数内真实危险
+        导入）。star-import 同策略。
+      - **静态不可达分支跳过**：``if False:`` / ``while False:`` 的 body
+        不再写入绑定（``if False: killer = print`` 曾覆盖 killer =
+        os.kill，使可达的 ``killer(...)`` 丢失危险身份）。
+      - **同名多次赋值保留全部候选**：顺序赋值/分支赋值一律 append，
+        解析时取第一个可解析候选（保守方向：任一候选危险即拦截）。
     """
     try:
         tree = ast.parse(code)
@@ -438,37 +489,104 @@ def _collect_exec_code_bindings(code):
     imports: dict = {}
     star_modules: set = set()
     raw_aliases: dict = {}
-    for node in ast.walk(tree):
+    import_depths: dict = {}   # local_name -> 绑定作用域深度（0=模块级）
+    star_depths: dict = {}     # top_module -> 绑定作用域深度
+
+    def _const_truthiness(node):
+        """字面量常量的真值（False/0/''/None/[] 等）；无法静态判定返回 None。"""
+        if isinstance(node, ast.Constant):
+            return bool(node.value)
+        return None
+
+    def _record_import(name, module, attr, depth):
+        # 外层/同深度后写优先；嵌套同名不覆盖模块级（review Blocker 1）。
+        prev = import_depths.get(name)
+        if prev is None or depth <= prev:
+            imports[name] = (module, attr)
+            import_depths[name] = depth
+
+    def _record_star(module, depth):
+        top = module.split(".")[0]
+        prev = star_depths.get(top)
+        if prev is None or depth <= prev:
+            star_modules.add(top)
+            star_depths[top] = depth
+
+    def _visit(node, depth):
+        # ── 函数/类/lambda 体是独立作用域：body 内绑定 depth+1 ──────
+        # （review Blocker 1：``def shadow(): import math as os`` 的函数体
+        # import 曾以模块级深度覆盖顶层 ``os``。iter_child_nodes 会把
+        # 函数体语句当作普通子节点，必须在这里把 body 提升一层。）
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef, ast.Lambda)):
+            if isinstance(node, ast.Lambda):
+                _visit(node.body, depth + 1)
+                return
+            for s in node.body:
+                _visit(s, depth + 1)
+            return
+
+        # ── 控制流：跳过静态不可达分支 ────────────────────────────
+        if isinstance(node, ast.If):
+            _visit(node.test, depth)
+            t = _const_truthiness(node.test)
+            if t is True:
+                for s in node.body:
+                    _visit(s, depth)
+            elif t is False:
+                for s in node.orelse:
+                    _visit(s, depth)
+            else:
+                for s in node.body:
+                    _visit(s, depth)
+                for s in node.orelse:
+                    _visit(s, depth)
+            return
+        if isinstance(node, ast.While):
+            t = _const_truthiness(node.test)
+            if t is False:
+                # while False 的 body 不执行；orelse 执行一次
+                for s in node.orelse:
+                    _visit(s, depth)
+                return
+            _visit(node.test, depth)
+            for s in node.body:
+                _visit(s, depth)
+            for s in node.orelse:
+                _visit(s, depth)
+            return
+
+        # ── 绑定节点 ──────────────────────────────────────────────
         if isinstance(node, ast.Import):
             for alias in node.names:
                 name = alias.asname or alias.name
-                imports[name] = (alias.name, None)
+                _record_import(name, alias.name, None, depth)
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
             for alias in node.names:
                 if alias.name == "*":
-                    star_modules.add(module.split(".")[0])
+                    _record_star(module, depth)
                     continue
                 name = alias.asname or alias.name
-                imports[name] = (module, alias.name)
+                _record_import(name, module, alias.name, depth)
         elif isinstance(node, ast.Assign):
             # 多重赋值 a = b = os.kill → targets=[a, b]，每个名字都绑定同一 RHS
             # （2026-08-25 re-review：曾只记录 len(targets)==1，多重赋值完全
             # 逃出绑定图 → a = b = os.kill 绕过 hard block）
             for t in node.targets:
                 if isinstance(t, ast.Name):
-                    raw_aliases[t.id] = node.value
+                    raw_aliases.setdefault(t.id, []).append(node.value)
                 elif isinstance(t, ast.Tuple) and isinstance(
                         node.value, (ast.Tuple, ast.List)):
                     # 元组解包 k1, k2 = os.kill, os.killpg → 按位置配对
                     # （2026-08-25 复测：Tuple 目标曾整段跳过 → k1(...) 放行）
                     for target_elt, value_elt in zip(t.elts, node.value.elts):
                         if isinstance(target_elt, ast.Name):
-                            raw_aliases[target_elt.id] = value_elt
+                            raw_aliases.setdefault(target_elt.id, []).append(value_elt)
         elif isinstance(node, ast.NamedExpr):
             # (k := os.kill) — walrus 绑定（2026-08-25 复测发现）
             if isinstance(node.target, ast.Name):
-                raw_aliases[node.target.id] = node.value
+                raw_aliases.setdefault(node.target.id, []).append(node.value)
         elif isinstance(node, ast.For):
             # for f in [os.kill]: f(...) — 字面量可迭代的目标绑定
             # （2026-08-25 复测：for 目标曾完全逃逸）
@@ -478,7 +596,15 @@ def _collect_exec_code_bindings(code):
                 first = node.iter.elts[0]
                 if isinstance(first, (ast.Name, ast.Attribute,
                                       ast.Subscript, ast.Call, ast.NamedExpr)):
-                    raw_aliases[node.target.id] = first
+                    raw_aliases.setdefault(node.target.id, []).append(first)
+
+        # ── 递归子节点（作用域深度已由入口的 FunctionDef/ClassDef/Lambda
+        #    分支处理，这里保持 depth 传递即可）──────────────────────
+        for child in ast.iter_child_nodes(node):
+            _visit(child, depth)
+
+    for stmt in tree.body:
+        _visit(stmt, 0)
     return imports, star_modules, raw_aliases
 
 
@@ -897,6 +1023,43 @@ _EXEC_CODE_READONLY_QUERY_NAMES = frozenset({
     "read_orc", "read_stata", "read_gbq", "read_sql_table", "read_sql_query",
 })
 
+# 无文件系统 I/O 的容器/字符串方法白名单（2026-08-25 re-review Blocker 3b）：
+# ``paths.append("/etc/passwd")`` 曾因 append 不在只读白名单 + 参数敏感
+# 而被误报为 protected-path 硬阻断——append 只是把字符串加进内存列表，
+# 不触碰文件系统。这些方法只操作内存对象（list/dict/set/str），携带
+# 敏感字符串参数不构成文件 I/O，必须放行。
+_EXEC_CODE_NO_IO_METHODS = frozenset({
+    # --- list / deque / 序列容器 ---
+    "append", "extend", "insert", "pop", "remove", "clear", "copy",
+    "count", "index", "sort", "reverse", "popleft", "appendleft",
+    # --- dict ---
+    "get", "setdefault", "update", "keys", "values", "items", "popitem",
+    "fromkeys",
+    # --- set / frozenset ---
+    "add", "discard", "union", "intersection", "difference",
+    "symmetric_difference", "issubset", "issuperset", "isdisjoint",
+    # --- str / bytes ---
+    "format", "split", "join", "strip", "rstrip", "lstrip", "upper",
+    "lower", "title", "capitalize", "casefold", "replace", "find",
+    "rfind", "index", "rindex", "startswith", "endswith", "encode",
+    "decode", "zfill", "ljust", "rjust", "center", "expandtabs",
+    "partition", "rpartition", "splitlines", "rsplit", "removeprefix",
+    "removesuffix", "isalnum", "isalpha", "isascii", "isdigit",
+    "islower", "isupper", "isspace", "istitle", "isnumeric",
+    "isdecimal", "isidentifier", "isprintable",
+    # --- 数值/通用对象方法（无 I/O） ---
+    "bit_length", "to_bytes", "from_bytes", "hex", "real", "imag",
+})
+
+# pathlib 变异方法（2026-08-25 re-review Blocker 3a receiver-bound）：
+# 这些方法的目标路径在 **receiver**（Path 构造参数）而不是调用参数里，
+# 且多数无参数（unlink/touch/chmod...）——参数型敏感检测看不到它们。
+# rename/replace 的语义：receiver 是源，参数是目标——两个方向都要检查。
+_EXEC_CODE_PATHLIB_MUTATORS = frozenset({
+    "unlink", "rmdir", "touch", "chmod", "chown", "mkdir",
+    "rename", "replace", "symlink_to", "hardlink_to",
+})
+
 _STRING_CONSTANT_EVAL_RE = re.compile(
     r"os\.path\.expanduser\((['\"])(.*?)\1\)", re.DOTALL
 )
@@ -929,19 +1092,19 @@ def _resolve_expr_path(expr, raw_aliases, imports) -> str | None:
                 return None
         return "".join(parts)
     if isinstance(expr, ast.Name) and expr.id in raw_aliases:
-        rhs = raw_aliases[expr.id]
-        if isinstance(rhs, ast.Constant) and isinstance(rhs.value, str):
-            return rhs.value
-        # os.path.expanduser("~/.hermes/config.yaml")
-        if (isinstance(rhs, ast.Call) and isinstance(rhs.func, ast.Attribute)
-                and isinstance(rhs.func.value, ast.Attribute)
-                and isinstance(rhs.func.value.value, ast.Name)
-                and rhs.func.value.value.id == "os"
-                and rhs.func.value.attr == "path"
-                and rhs.func.attr == "expanduser"
-                and rhs.args and isinstance(rhs.args[0], ast.Constant)
-                and isinstance(rhs.args[0].value, str)):
-            return os.path.expanduser(rhs.args[0].value)
+        for rhs in raw_aliases[expr.id]:
+            # os.path.expanduser("~/.hermes/config.yaml")
+            if (isinstance(rhs, ast.Constant) and isinstance(rhs.value, str)):
+                return rhs.value
+            if (isinstance(rhs, ast.Call) and isinstance(rhs.func, ast.Attribute)
+                    and isinstance(rhs.func.value, ast.Attribute)
+                    and isinstance(rhs.func.value.value, ast.Name)
+                    and rhs.func.value.value.id == "os"
+                    and rhs.func.value.attr == "path"
+                    and rhs.func.attr == "expanduser"
+                    and rhs.args and isinstance(rhs.args[0], ast.Constant)
+                    and isinstance(rhs.args[0].value, str)):
+                return os.path.expanduser(rhs.args[0].value)
     # 任意可解析的 os.path 函数调用 — 统一走 _resolve_call_target：
     #   h = os.path.expanduser; h("...")（函数引用别名）
     #   p = os.path; p.expanduser("...")（组合属性别名，2026-08-25 re-review）
@@ -1078,6 +1241,21 @@ def _execute_code_has_sensitive_write(code: str) -> str | None:
                     target = _resolve_expr_path(ctor.args[0], raw_aliases, imports)
                     if target and _write_target_is_sensitive(target):
                         return target
+        # receiver-bound mutations（2026-08-25 re-review Blocker 3a）：
+        # Path("/root/.ssh/authorized_keys").unlink() / touch() / chmod()
+        # 等——目标路径在 **receiver**（Path 构造参数）里且方法无参数，
+        # 参数型检测完全看不到。unlink/rmdir 删除敏感文件、touch/chmod
+        # 篡改敏感文件、symlink_to/hardlink_to 在敏感区建链接，都是
+        # #49578 目标不变量的变异侧。
+        elif (resolved is not None and resolved[0] == "pathlib"
+              and resolved[1] in _EXEC_CODE_PATHLIB_MUTATORS):
+            if not isinstance(func, ast.Attribute):
+                continue
+            ctor = _resolve_path_constructor(func.value, raw_aliases, imports)
+            if ctor is not None and ctor.args:
+                target = _resolve_expr_path(ctor.args[0], raw_aliases, imports)
+                if target and _write_target_is_sensitive(target):
+                    return target
     return None
 
 
@@ -1123,6 +1301,22 @@ def _execute_code_touches_sensitive_path(code: str) -> str | None:
             func, imports, star_modules, raw_aliases, _EXEC_CODE_DANGEROUS_CALLS
         )
         if resolved in (("builtins", "open"), ("pathlib", "open")):
+            continue
+        # pathlib 变异方法（unlink/touch/chmod/rename/replace/...）的目标
+        # 可能是 receiver（sensitive_write 处理）或参数（这里处理）——
+        # 不能套用内存容器方法的 NO_IO 白名单：``Path(x).replace(
+        # "/root/.ssh/authorized_keys")`` 的 replace 与 str.replace 同名，
+        # 但前者是文件覆盖，必须检查参数目标。
+        if resolved is not None and resolved[0] == "pathlib" \
+                and resolved[1] in _EXEC_CODE_PATHLIB_MUTATORS:
+            pass  # 落入下方参数检查
+        elif resolved is None and method in _EXEC_CODE_NO_IO_METHODS:
+            # 内存容器/字符串方法，敏感字符串参数不构成文件 I/O
+            # （``paths.append("/etc/passwd")`` 只是往列表加字符串）。
+            # 仅在调用目标**无法解析**时适用——``os.remove`` /
+            # ``shutil.copy`` 等已知目标的 method 名（remove/copy）与
+            # list.remove/list.copy 撞名，但语义是文件操作，必须继续
+            # 参数检查（2026-08-25 回归：曾误跳过 shutil.copy 检测）。
             continue
 
         # 检查所有位置参数 + 关键字参数是否静态解析为敏感路径
