@@ -721,6 +721,27 @@ def _collect_exec_code_bindings(code):
                 if isinstance(first, (ast.Name, ast.Attribute,
                                       ast.Subscript, ast.Call, ast.NamedExpr)):
                     raw_aliases.setdefault(node.target.id, []).append(first)
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp,
+                               ast.GeneratorExp)):
+            # comprehension 目标绑定（2026-08-29 re-review Blocker 1）：
+            # ``[k(os.getpid(), 15) for k in [os.kill]]`` 的 k 曾完全逃出
+            # 绑定图（_visit 只处理语句级 ast.For，推导式的 ast.comprehension
+            # 节点是表达式级循环目标——同一能力的不同 AST 形状）。运行时
+            # 该推导式真的调用 os.kill，而 callee Name('k') 无法解析 →
+            # hard block / danger pass 双漏，本地路径 auto-approve。
+            # 与 ast.For 同一保守字面量可迭代规则：每个 generator 的
+            # target（Name）绑定 iterable 首元素候选；含嵌套 generators
+            # （[[k(...) for k in [os.kill]] for _ in [1]] 的内层 comp
+            # 由通用递归触达同一分支）。
+            for gen in node.generators:
+                if (isinstance(gen.target, ast.Name)
+                        and isinstance(gen.iter, (ast.List, ast.Tuple))
+                        and gen.iter.elts):
+                    first = gen.iter.elts[0]
+                    if isinstance(first, (ast.Name, ast.Attribute,
+                                          ast.Subscript, ast.Call,
+                                          ast.NamedExpr)):
+                        raw_aliases.setdefault(gen.target.id, []).append(first)
 
         # ── 递归子节点（作用域深度已由入口的 FunctionDef/ClassDef/Lambda
         #    分支处理，这里保持 depth 传递即可）──────────────────────

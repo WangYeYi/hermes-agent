@@ -829,3 +829,76 @@ def test_process_launch_family_flagged_command_exec(code):
 def test_process_launch_family_benign_passes(code):
     assert _execute_code_has_dangerous_ops(code) is None
     assert _execute_code_touches_sensitive_path(code) is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2026-08-29 re-review (andrexibiza) Blocker: comprehension targets
+# ─────────────────────────────────────────────────────────────────────
+# 推导式目标逃出绑定图（修复前 head fc97920507 上全部失败）：
+#   [k(os.getpid(), 15) for k in [os.kill]] — 运行时真调用 os.kill，
+#   但 callee Name('k') 无法解析 → hard block / danger pass 双漏，
+#   本地路径 auto-approve。与语句级 ast.For 同一能力（字面量可迭代
+#   目标绑定），只是不同的 AST 形状（ast.comprehension）。
+
+COMPREHENSION_KILL_CASES = [
+    'import os\n[k(os.getpid(), 15) for k in [os.kill]]',
+    'import os\nnext(k(os.getpid(), 15) for k in [os.kill])',
+    'import os\n{k(os.getpid(), 15) for k in [os.kill]}',
+    'import os\n{k: k(os.getpid(), 15) for k in [os.kill]}',
+    # 嵌套 generators（内层 comp 由通用递归触达）
+    'import os\n[[k(os.getpid(), 15) for k in [os.kill]] for _ in [1]]',
+]
+
+
+@pytest.mark.parametrize("code", COMPREHENSION_KILL_CASES)
+def test_comprehension_target_kill_detected(code):
+    """comprehension 目标 k 绑定到字面量可迭代候选 → os.kill 可解析
+    （修复前 approved=True，硬阻断漏拦）。"""
+    reason = _execute_code_has_self_destructive_ops(code)
+    assert reason is not None
+    assert "os.kill" in reason
+
+
+@pytest.mark.parametrize("code", COMPREHENSION_KILL_CASES)
+@pytest.mark.parametrize("mode_gate", ["normal", "yolo", "off"])
+def test_comprehension_target_kill_hard_blocked_in_all_modes(
+        monkeypatch, mode_gate, code):
+    """推导式里的 os.kill 在普通/yolo/approvals-off 下全部 hard_blocked。"""
+    import tools.approval as approval_module
+    if mode_gate == "yolo":
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    elif mode_gate == "off":
+        monkeypatch.setattr(
+            approval_module, "_get_approval_mode", lambda: "off"
+        )
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["approved"] is False
+    assert result["outcome"] == "hard_blocked"
+
+
+def test_comprehension_target_command_exec_detected():
+    """danger pass 同样受益：推导式里的 subprocess.run 别名进入审批链
+    （review 指出 ordinary danger pass 有同样的 missing alias）。"""
+    code = 'import subprocess\n[k("rm -rf /", shell=True) for k in [subprocess.run]]'
+    assert _execute_code_has_dangerous_ops(code) == "command-exec"
+
+
+@pytest.mark.parametrize("code", [
+    # 纯数值字面量（无模块语义）
+    '[x * 2 for x in [1, 2, 3]]',
+    '[x.upper() for x in ["a", "b"]]',
+    # 非字面量 iterable（range/call）→ 不绑定，保守不误报
+    'import os\n[os.path.join("/tmp", str(x)) for x in range(3)]',
+    # 安全模块调用
+    'import os\n[os.getcwd() for _ in [1]]',
+    'import os\n[os.path.exists(p) for p in ["/tmp"]]',
+    # 生成器安全求和
+    'sum(x * x for x in range(10))',
+    # 目标绑定安全函数（os.path.join 不在危险集）
+    'import os\n[f("/tmp", "x") for f in [os.path.join]]',
+])
+def test_comprehension_benign_passes(code):
+    """保守候选模型不得把每个局部推导式变成安全终端状态。"""
+    assert _execute_code_has_self_destructive_ops(code) is None
+    assert _execute_code_has_dangerous_ops(code) is None
+    assert _execute_code_touches_sensitive_path(code) is None
