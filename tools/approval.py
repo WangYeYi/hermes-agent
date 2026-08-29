@@ -5510,6 +5510,7 @@ from tools.exec_code_policy import (
     _execute_code_has_dangerous_ops,
     _execute_code_has_self_destructive_ops,
     _execute_code_has_sensitive_write,
+    _execute_code_has_package_acquisition,
     _execute_code_touches_sensitive_path,
     _exec_code_reason_text,
     _log_blocked_exec_code,
@@ -5621,6 +5622,39 @@ def check_execute_code_guard(code: str, env_type: str,
                 "blocked — destination invariant #49578)"
             ),
             "outcome": "hard_blocked",
+            "user_consent": False,
+        }
+
+    # ── Layer 4c: Package acquisition invariant (#97657 BLOCKER 2) ────
+    # #97657 (dandckr-ops) introduces the owner-gated package-acquisition
+    # boundary for terminal strings; execute_code can reach the same
+    # package managers via subprocess/os.system process-launch calls
+    # without passing through terminal approval. The same invariant is
+    # enforced HERE — before the isolated-backend / container / --yolo /
+    # approvals.mode=off short-circuits — so package acquisition stays
+    # owner-gated even where ordinary host-oriented guards are skipped
+    # (andrexibiza #97657 review: "the package decision occurring before
+    # the generic container/YOLO/off short-circuits").
+    _pkg = _execute_code_has_package_acquisition(code)
+    if _pkg is not None:
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: execute_code acquires packages via {_pkg} "
+                f"({_pkg} install/add/run). Package acquisition is a "
+                "supply-chain trust boundary: it requires the owner's exact "
+                "one-operation approval and is never auto-approved — not "
+                "under --yolo, approvals.mode=off, Smart Approval, or in "
+                "isolated backends (#97657). Run it through the terminal "
+                "tool instead (same owner gate applies there), or approve "
+                "this exact operation explicitly."
+            ),
+            "pattern_key": "package acquisition",
+            "description": (
+                "execute_code package acquisition (owner-gated — no yolo/off/"
+                "container bypass, matching #97657 terminal invariant)"
+            ),
+            "outcome": "package_acquisition",
             "user_consent": False,
         }
 

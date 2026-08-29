@@ -25,6 +25,7 @@ from tools.approval import (
 )
 from tools.exec_code_policy import (
     _execute_code_has_sensitive_write,
+    _execute_code_has_package_acquisition,
     _execute_code_touches_sensitive_path,
 )
 
@@ -902,3 +903,80 @@ def test_comprehension_benign_passes(code):
     assert _execute_code_has_self_destructive_ops(code) is None
     assert _execute_code_has_dangerous_ops(code) is None
     assert _execute_code_touches_sensitive_path(code) is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Package acquisition invariant — execute_code side (#97657 BLOCKER 2)
+# ─────────────────────────────────────────────────────────────────────
+# #97657 (dandckr-ops) makes package acquisition owner-gated in the
+# terminal layer; andrexibiza's review assigned the execute_code side to
+# #65592. The same invariant must hold for process-launch calls inside
+# execute_code scripts (subprocess/os.system/...), BEFORE the
+# container/YOLO/off short-circuits — isolated backends included.
+# All detection tests below FAIL on fc97920507 (no package detection).
+
+PACKAGE_ACQUISITION_CASES = [
+    # andrexibiza #97657 review 的三个例子
+    'import subprocess\nsubprocess.run(["apk", "add", "openssh"])',
+    'import subprocess\nsubprocess.run(["npm", "add", "plausible-vendor-sdk"])',
+    'import subprocess\nsubprocess.run(["uv", "run", "--with", "plausible-vendor-sdk", "python", "-c", "import x"])',
+    # 常见形状
+    'import subprocess\nsubprocess.run(["pip", "install", "pkg"], check=True)',
+    'import subprocess\nsubprocess.run("pip install pkg", shell=True)',
+    'import os\nos.system("pip install pkg")',
+    'import subprocess\nsubprocess.Popen(["npm", "install", "pkg"])',
+    'import asyncio\nasyncio.create_subprocess_exec("pip", "install", "pkg")',
+    'import subprocess\ncmd = ["pip", "install", "pkg"]\nsubprocess.run(cmd)',
+    'import subprocess\nsubprocess.run(["uv", "sync"])',
+]
+
+
+@pytest.mark.parametrize("code", PACKAGE_ACQUISITION_CASES)
+def test_package_acquisition_detected(code):
+    """execute_code 里的包获取调用必须被识别（返回包管理器名）。"""
+    assert _execute_code_has_package_acquisition(code) is not None
+
+
+@pytest.mark.parametrize("code", PACKAGE_ACQUISITION_CASES)
+@pytest.mark.parametrize("mode_gate", ["normal", "yolo", "off"])
+def test_package_acquisition_owner_gated_in_all_modes(monkeypatch, mode_gate, code):
+    """包获取在普通/yolo/approvals-off 下全部拒绝（owner-gated，
+    检查位于 YOLO/off 短路之前）。"""
+    import tools.approval as approval_module
+    if mode_gate == "yolo":
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    elif mode_gate == "off":
+        monkeypatch.setattr(
+            approval_module, "_get_approval_mode", lambda: "off"
+        )
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["approved"] is False
+    assert result["outcome"] == "package_acquisition"
+
+
+@pytest.mark.parametrize("env_type", ["vercel_sandbox", "docker"])
+def test_package_acquisition_owner_gated_in_isolated_backends(env_type):
+    """隔离后端同样 owner-gated：容器/沙箱 skip 在包获取检查之后。"""
+    code = 'import subprocess\nsubprocess.run(["pip", "install", "pkg"])'
+    result = check_execute_code_guard(code, env_type=env_type,
+                                      has_host_access=False)
+    assert result["approved"] is False
+    assert result["outcome"] == "package_acquisition"
+
+
+@pytest.mark.parametrize("code", [
+    # 非获取命令不误报（确认式检测）
+    'import subprocess\nsubprocess.run(["npm", "run", "build"])',
+    'import subprocess\nsubprocess.run(["pip", "list"])',
+    'import subprocess\nsubprocess.run(["apt", "search", "openssh"])',
+    'import subprocess\nsubprocess.run(["apk", "info", "openssh"])',
+    'import subprocess\nsubprocess.run(["git", "clone", "https://example.com/x"])',
+    'import subprocess\nsubprocess.run(["python", "-c", "print(1+1)"])',
+    'import subprocess\nsubprocess.run("echo \'pip install x\'", shell=True)',
+    # 静态不可解析参数 → 不确认 → 放行（留给运行时边界）
+    'import subprocess\nsubprocess.run(cmd, shell=True)',
+    # 非命令执行调用（读文件等）
+    'import subprocess\nsubprocess.run(["cat", "/etc/hostname"])',
+])
+def test_package_acquisition_benign_passes(code):
+    assert _execute_code_has_package_acquisition(code) is None

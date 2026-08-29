@@ -28,6 +28,7 @@ import logging
 import os
 import posixpath
 import re
+import shlex
 
 logger = logging.getLogger(__name__)
 
@@ -1678,3 +1679,249 @@ def _classify_exec_code_imports(code: str) -> tuple[list[str], list[str], list[s
                     unknown.append(top)
 
     return safe, dangerous, unknown
+
+
+# =========================================================================
+# Package Acquisition Detection — execute_code side (#97657 BLOCKER 2)
+# =========================================================================
+# #97657 (dandckr-ops) introduces the owner-gated package-acquisition
+# invariant for *terminal strings*: acquiring packages from registries is
+# a supply-chain trust boundary requiring the owner's exact one-operation
+# approval; YOLO / approvals.mode=off / Smart Approval / reusable scopes /
+# isolated-container skips cannot bypass it. andrexibiza's review of
+# #97657 assigned the *execute_code* side to this PR (#65592): a script
+# can reach the same package managers via subprocess/os.system process-
+# launch calls without passing through terminal approval, so the same
+# invariant must hold here — BEFORE the container/YOLO/off short-circuits
+# in check_execute_code_guard (isolated backends included).
+#
+# The word vocabulary mirrors tools/approval.py's _package_argv_is_acquisition
+# (#97657) plus the alias spellings named in its review (apk add, npm add,
+# uv run --with). Implemented independently — #97657 is unmerged and this
+# PR must not import its branch code — so the two PRs compose regardless
+# of which approval owner lands first.
+#
+# Detection is *confirmatory*, not conservative: it fires only when the
+# process-launch argument statically resolves to an acquisition argv
+# (literal string / literal list / foldable variable). A statically
+# unresolvable argument is left to the runtime boundary — blocking every
+# unparseable subprocess call would turn ordinary scripts into security
+# terminals (npm run build is not acquisition).
+
+_PACKAGE_EXEC_WRAPPERS = frozenset({
+    "command", "builtin", "exec", "nohup", "setsid", "time", "nice",
+    "timeout", "stdbuf", "sudo", "env", "xargs", "docker", "podman",
+    "nerdctl", "cmd", "wsl",
+})
+
+
+def _package_words_are_acquisition(words: list[str]) -> str | None:
+    """判定 argv 词表是否为包获取命令；返回包管理器名，否则 None。
+
+    与 #97657 ``_package_argv_is_acquisition`` 语义对齐 + review 补别名
+    （apk add / npm add / uv run --with）。wrapper（sudo/env/docker/...）
+    前缀剥除后检查内部命令；help 标志不构成获取。
+    """
+    if not words:
+        return None
+    argv = [w.strip("\"'").lower() for w in words]
+    idx = 0
+    while idx < len(argv) and argv[idx] in _PACKAGE_EXEC_WRAPPERS:
+        idx += 1
+    if idx >= len(argv):
+        return None
+    exe = re.split(r"[\\/]", argv[idx])[-1].removesuffix(".exe")
+    args = argv[idx + 1:]
+    if "--help" in args or "-h" in args:
+        return None
+
+    def has(action: str) -> bool:
+        return action in args
+
+    if re.fullmatch(r"(?:python(?:\d+(?:\.\d+)*)?|py)", exe):
+        if any(args[i] == "-m" and args[i + 1] == "pip"
+               and "install" in args[i + 2:]
+               for i in range(len(args) - 1)):
+            return "pip"
+        return None
+    if re.fullmatch(r"pip(?:\d+(?:\.\d+)*)?", exe):
+        return "pip" if has("install") else None
+    if exe == "pipx":
+        return "pipx" if any(a in args for a in {"install", "run", "runpip"}) else None
+    if exe == "uv":
+        if "pip" in args and "install" in args[args.index("pip") + 1:]:
+            return "uv"
+        if any(a in args for a in {"add", "sync"}):
+            return "uv"
+        if any(args[i] == "tool" and args[i + 1] in {"install", "run"}
+               for i in range(len(args) - 1)):
+            return "uv"
+        # review 补：uv run --with <pkg> 把包装进调用环境（临时安装）
+        if "run" in args and "--with" in args:
+            return "uv"
+        return None
+    if exe == "uvx":
+        return "uvx"
+    if exe == "npm":
+        # review 补：npm add 是 npm install 的文档化别名
+        if any(a in args for a in {"install", "i", "ci", "exec", "add"}):
+            return "npm"
+        return None
+    if exe == "npx":
+        return "npx"
+    if exe == "pnpm":
+        return "pnpm" if any(a in args for a in {"add", "install", "i", "dlx"}) else None
+    if exe == "yarn":
+        return "yarn" if any(a in args for a in {"add", "install", "dlx"}) else None
+    if exe == "bun":
+        return "bun" if any(a in args for a in {"add", "install", "i", "x"}) else None
+    if exe == "deno":
+        if any(a in args for a in {"install", "add"}):
+            return "deno"
+        if "run" in args and any(f in args for f in {"--allow-all", "-a"}):
+            return "deno"
+        return None
+    if exe in {"cargo", "gem", "go", "winget", "choco", "scoop", "brew"}:
+        return exe if has("install") else None
+    if exe in {"apk", "apt", "apt-get", "dnf", "yum", "zypper"}:
+        # review 补：apk add 是 Alpine 的包安装操作（apt 系仍以 install 为主，
+        # 但 add 一并覆盖无成本）
+        return exe if (has("install") or has("add")) else None
+    if exe == "pacman":
+        return "pacman" if any(a.startswith("-s") and a != "-ss" for a in args) else None
+    if exe in {"conda", "mamba", "micromamba"}:
+        return exe if any(a in args for a in {"install", "create", "update"}) else None
+    if exe == "dotnet":
+        return "dotnet" if any(args[i] == "tool" and args[i + 1] == "install"
+                               for i in range(len(args) - 1)) else None
+    if exe == "poetry":
+        return "poetry" if any(a in args for a in {"add", "install", "update"}) else None
+    if exe == "composer":
+        return "composer" if any(a in args for a in {"require", "install", "update"}) else None
+    if exe == "bundle":
+        return "bundle" if any(a in args for a in {"install", "update"}) else None
+    return None
+
+
+def _arg_to_argv(expr, raw_aliases, imports) -> list[str] | None:
+    """把进程启动调用的参数表达式静态解析为 argv 词表。
+
+    覆盖：字符串字面量（shlex 分词）、bytes 字面量、list/tuple 字面量
+    （元素均为字符串字面量）、简单变量别名（递归）、可折叠字符串
+    （拼接 / decode / f-string / expanduser，复用 _resolve_expr_path）。
+    静态不可解析返回 None —— 包获取是**确认式**检测，不可判定形状
+    留给运行时边界，避免误拦正常脚本。
+    """
+    if expr is None:
+        return None
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        try:
+            return shlex.split(expr.value)
+        except ValueError:
+            return None
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, bytes):
+        try:
+            return shlex.split(expr.value.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+    if isinstance(expr, (ast.List, ast.Tuple)):
+        words = []
+        for elt in expr.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                words.append(elt.value)
+            else:
+                return None
+        return words
+    if isinstance(expr, ast.Name) and expr.id in raw_aliases:
+        for cand in raw_aliases[expr.id]:
+            resolved = _arg_to_argv(cand, raw_aliases, imports)
+            if resolved is not None:
+                return resolved
+        return None
+    folded = _resolve_expr_path(expr, raw_aliases, imports)
+    if isinstance(folded, str):
+        try:
+            return shlex.split(folded)
+        except ValueError:
+            return None
+    return None
+
+
+def _call_arg_expr(node: ast.Call, position: int, keyword: str | None):
+    """按位置/关键字取调用参数表达式（位置优先，keyword 兜底）。"""
+    if len(node.args) > position:
+        return node.args[position]
+    if keyword:
+        for kw in node.keywords:
+            if kw.arg == keyword:
+                return kw.value
+    return None
+
+
+def _execute_code_has_package_acquisition(code: str) -> str | None:
+    """返回脚本中静态可确认的包获取调用的包管理器名，否则 None。
+
+    只检查命令执行家族的调用（subprocess.* / os.system / os.popen /
+    os.spawn* / pty.spawn / asyncio.create_subprocess_* / posix.spawn*），
+    按调用形状提取 argv 后走 ``_package_words_are_acquisition`` 词表判定。
+    与 #97657 的 terminal 侧同一不变量：包获取必须 owner 精确单操作
+    批准，容器/YOLO/approvals-off 均不可绕过（guard 在短路前调用本函数）。
+    """
+    imports, star_modules, raw_aliases = _collect_exec_code_bindings(code)
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        resolved = _resolve_call_target(
+            node.func, imports, star_modules, raw_aliases,
+            _EXEC_CODE_DANGEROUS_CALLS,
+        )
+        if resolved is None:
+            continue
+        m, a = resolved
+        # 只检查命令执行能力（精确表或家族规则）
+        is_command_exec = (
+            _EXEC_CODE_DANGEROUS_CALLS.get((m, a)) == "command-exec"
+            or _match_command_exec_family(m, a) is not None
+        )
+        if not is_command_exec:
+            continue
+        words = None
+        if m == "subprocess":
+            # run/call/Popen/check_output/check_call: args 位置 0 或 args=
+            words = _arg_to_argv(
+                _call_arg_expr(node, 0, "args"), raw_aliases, imports)
+        elif m == "os" and a in ("system", "popen"):
+            words = _arg_to_argv(_call_arg_expr(node, 0, None), raw_aliases, imports)
+        elif m == "pty" and a == "spawn":
+            words = _arg_to_argv(_call_arg_expr(node, 0, None), raw_aliases, imports)
+        elif m == "asyncio" and a == "create_subprocess_shell":
+            words = _arg_to_argv(_call_arg_expr(node, 0, None), raw_aliases, imports)
+        elif m == "asyncio" and a == "create_subprocess_exec":
+            # 全部位置参数即 argv（程序名 + 参数）
+            words = []
+            ok = True
+            for arg in node.args:
+                part = _arg_to_argv(arg, raw_aliases, imports)
+                if part is None:
+                    ok = False
+                    break
+                words.extend(part)
+            if not ok:
+                words = None
+        elif (m in ("os", "posix")
+              and (a.startswith("spawn") or a.startswith("exec"))):
+            # os.spawnv(mode, path, argv) / posix.spawn(path, argv, env) —
+            # argv 是最后一个位置参数（列表字面量）
+            if node.args:
+                words = _arg_to_argv(node.args[-1], raw_aliases, imports)
+        if not words:
+            continue
+        pkg = _package_words_are_acquisition(words)
+        if pkg is not None:
+            return pkg
+    return None
