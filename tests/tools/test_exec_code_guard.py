@@ -647,4 +647,185 @@ def test_new_binding_shapes_benign_passes(code):
     """新解析能力只影响危险形状，良性代码零误伤。"""
     assert _execute_code_has_self_destructive_ops(code) is None
     assert _execute_code_has_sensitive_write(code) is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2026-08-28 re-review (andrexibiza) Blocker 1/2/3 regressions
+# ─────────────────────────────────────────────────────────────────────
+# 三个 blocker 的复现（修复前 head d73f538529 上全部失败）：
+#   1. 兄弟局部作用域 import 互相污染 → os.kill 解析成 math.kill 放行
+#   2. open(file=..., mode="w") 关键字形式 → 敏感写目标无法恢复，
+#      yolo/approvals-off 击穿 #49578 不变量
+#   3. asyncio.create_subprocess_* / os.startfile / pty.spawn 不在
+#      命令执行精确表 → 本地静默放行
+
+# ── Blocker 1: sibling-scope import contamination ─────────────────────
+
+SIBLING_SCOPE_KILL = '''
+def dangerous():
+    import os
+    os.kill(os.getppid(), 15)
+
+def harmless():
+    import math as os
+    return os.sqrt(4)
+
+dangerous()
+'''
+
+def test_sibling_scope_import_does_not_shadow_dangerous_binding():
+    """两个兄弟函数同名 import：harmless 的 ``import math as os`` 不得
+    把 dangerous 的 ``import os`` 从绑定图中擦除（修复前 os.kill 被解析
+    成 math.kill → hard block 漏拦，approved=True）。"""
+    reason = _execute_code_has_self_destructive_ops(SIBLING_SCOPE_KILL)
+    assert reason is not None
+    assert "os.kill" in reason
+
+
+@pytest.mark.parametrize("mode_gate", ["normal", "yolo", "off"])
+def test_sibling_scope_kill_hard_blocked_in_all_modes(monkeypatch, mode_gate):
+    """兄弟作用域污染的 os.kill 在普通/yolo/approvals-off 下全部
+    hard_blocked（硬阻断在 yolo/off 门之前执行）。"""
+    import tools.approval as approval_module
+    if mode_gate == "yolo":
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    elif mode_gate == "off":
+        monkeypatch.setattr(
+            approval_module, "_get_approval_mode", lambda: "off"
+        )
+    result = check_execute_code_guard(SIBLING_SCOPE_KILL, env_type="local")
+    assert result["approved"] is False
+    assert result["outcome"] == "hard_blocked"
+
+
+def test_sibling_scope_safe_usage_still_passes():
+    """候选保留模型不得误伤：harmless 函数的 ``os.sqrt(4)`` 与模块级
+    安全 os 用法仍放行。"""
+    code = '''
+def dangerous():
+    import os
+    os.kill(os.getppid(), 15)
+
+def harmless():
+    import math as os
+    return os.sqrt(4)
+'''
+    # 只调 harmless（不调 dangerous）→ dangerous 体内的调用不执行，但
+    # 静态层仍会看到它——候选保留使 os.kill 命中硬阻断；而单独的
+    # harmless 用法必须放行：
+    harmless_only = '''
+def harmless():
+    import math as os
+    return os.sqrt(4)
+
+print(harmless())
+'''
+    assert _execute_code_has_self_destructive_ops(harmless_only) is None
+    assert _execute_code_has_dangerous_ops(harmless_only) is None
+
+
+def test_nested_sibling_import_no_cross_contamination():
+    """更深的兄弟污染形状：嵌套函数里同名 import + 模块级调用。"""
+    code = '''
+import os
+
+def shadow():
+    import math as os
+
+os.kill(os.getpid(), 15)
+'''
+    reason = _execute_code_has_self_destructive_ops(code)
+    assert reason is not None
+    assert "os.kill" in reason
+
+
+# ── Blocker 2: builtin-open keyword file= bypass (#49578) ─────────────
+
+@pytest.mark.parametrize("code", [
+    'open(file="/root/.hermes/config.yaml", mode="w").write("x")',
+    'open(file="/root/.ssh/authorized_keys", mode="a").write("x")',
+    # mode 缺省但 file 关键字（缺省 r，只读，不应命中 sensitive-write；
+    # 但 open-write 判定由 _open_mode_is_write 负责，此处验证目标恢复）
+    'import os\nopen(file=os.path.expanduser("~/.hermes/config.yaml"), mode="w").write("x")',
+    # io.open 与内置 open 同签名（Blocker 2 等效面）
+    'import io\nio.open(file="/root/.hermes/config.yaml", mode="w").write("x")',
+    'import io\nio.open("/root/.hermes/config.yaml", mode="w").write("x")',
+    # codecs.open 用 filename 关键字（Blocker 2 等效面）
+    'import codecs\ncodecs.open(filename="/root/.hermes/config.yaml", mode="w").write("x")',
+    'import codecs\ncodecs.open("/root/.hermes/config.yaml", mode="w").write("x")',
+])
+def test_open_keyword_file_sensitive_write_detected(code):
+    """open 的 file 参数关键字形式必须恢复写目标（修复前
+    _resolve_static_write_target 只读位置参数 → 目标为 None →
+    #49578 不变量降级为可恢复审批）。"""
+    assert _execute_code_has_sensitive_write(code) is not None
+
+
+@pytest.mark.parametrize("code", [
+    'open(file="/root/.hermes/config.yaml", mode="w").write("x")',
+    'import io\nio.open(file="/root/.hermes/config.yaml", mode="w").write("x")',
+    'import codecs\ncodecs.open(filename="/root/.hermes/config.yaml", mode="w").write("x")',
+])
+@pytest.mark.parametrize("mode_gate", ["normal", "yolo", "off"])
+def test_open_keyword_sensitive_write_hard_blocked_in_all_modes(
+        monkeypatch, mode_gate, code):
+    """open 关键字形式在 yolo/approvals-off 下同样不可覆盖
+    （#49578 目标不变量，修复前 yolo/off 击穿 approved=True）。"""
+    import tools.approval as approval_module
+    if mode_gate == "yolo":
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    elif mode_gate == "off":
+        monkeypatch.setattr(
+            approval_module, "_get_approval_mode", lambda: "off"
+        )
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["approved"] is False
+    assert result["outcome"] == "hard_blocked"
+    assert "protected path" in result["message"]
+
+
+@pytest.mark.parametrize("code", [
+    # file= 关键字只读形态不误报
+    'open(file="/root/.hermes/config.yaml", mode="r").read()',
+    'open(file="/root/.hermes/config.yaml").read()',
+    'import io\nio.open(file="/root/.hermes/config.yaml").read()',
+    'import codecs\ncodecs.open(filename="/root/.hermes/config.yaml").read()',
+    # 非敏感目标关键字写 → 只落 open-write 审批（不硬阻断）
+    'open(file="/tmp/x.txt", mode="w").write("x")',
+])
+def test_open_keyword_read_or_non_sensitive_passes(code):
+    assert _execute_code_has_sensitive_write(code) is None
+
+
+# ── Blocker 3: process-launch family (asyncio / os.startfile / pty) ───
+
+@pytest.mark.parametrize("code", [
+    'import asyncio\nasyncio.create_subprocess_exec("rm", "-rf", "/")',
+    'import asyncio\nasyncio.create_subprocess_shell("rm -rf /")',
+    'import os\nos.startfile("evil.bat")',
+    'import pty\npty.spawn("/bin/sh")',
+    # 家族前缀规则（不逐名枚举）：asyncio.create_subprocess_* 前缀、
+    # os/posix spawn*/exec* 前缀、subprocess 模块级
+    'import asyncio\nasyncio.create_subprocess_exec2("x")',
+    'import posix\nposix.spawnv(0, "/bin/sh", ["/bin/sh"])',
+    'import posix\nposix.execl("/bin/sh", "/bin/sh")',
+])
+def test_process_launch_family_flagged_command_exec(code):
+    """asyncio/os.startfile/pty.spawn 与 subprocess 同等级：进入审批链
+    （修复前本地路径静默放行）。"""
+    assert _execute_code_has_dangerous_ops(code) == "command-exec"
+
+
+@pytest.mark.parametrize("code", [
+    # asyncio 非进程用法不误报
+    'import asyncio\nasyncio.sleep(1)',
+    'import asyncio\nasyncio.create_task(asyncio.sleep(1))',
+    # os 无害用法不误报
+    'import os\nprint(os.path.join("/tmp", "x"))',
+    'import os\nprint(os.getcwd())',
+    # pty 非 spawn 方法不误报
+    'import pty\nprint(pty.openpty())',
+])
+def test_process_launch_family_benign_passes(code):
+    assert _execute_code_has_dangerous_ops(code) is None
     assert _execute_code_touches_sensitive_path(code) is None
