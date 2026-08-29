@@ -106,6 +106,17 @@ _EXEC_CODE_DANGEROUS_CALLS = {
     ("os", "execlpe"): "command-exec",
     ("os", "posix_spawn"): "command-exec",
     ("os", "posix_spawnp"): "command-exec",
+    # ── 能力类别 3b：进程启动新入口（2026-08-28 re-review Blocker 3）──
+    # asyncio.create_subprocess_exec/shell 是 async 版 subprocess；
+    # os.startfile 是 Windows 的进程启动（用关联程序打开/执行文件）；
+    # pty.spawn 在伪终端里执行命令。三者都是「创建进程执行外部程序」
+    # 的同一能力，曾不在精确名字表中 → 本地 yolo/approvals-off 路径
+    # 静默执行。列在这里 + 家族前缀规则（见 _match_command_exec_family）
+    # 双保险：精确表给可读 reason，家族规则兜底 stdlib 演进。
+    ("os", "startfile"): "command-exec",
+    ("pty", "spawn"): "command-exec",
+    ("asyncio", "create_subprocess_exec"): "command-exec",
+    ("asyncio", "create_subprocess_shell"): "command-exec",
     # ── 能力类别 4：文件内容写入（pathlib，#49578 等效面）──
     ("pathlib", "write_text"): "open-write",
     ("pathlib", "write_bytes"): "open-write",
@@ -123,6 +134,52 @@ _EXEC_CODE_SUSPICIOUS_IMPORTS = frozenset({"ctypes"})
 _EXEC_CODE_DANGEROUS_BUILTINS = frozenset({
     "open", "eval", "exec", "compile", "__import__",
 })
+
+# 命令执行家族的**家族级**规则（2026-08-28 re-review Blocker 3 根因修复）。
+# 精确名字表（_EXEC_CODE_DANGEROUS_CALLS 的 command-exec 项）永远追不上
+# stdlib 演进——asyncio.create_subprocess_*、os.startfile、pty.spawn 都是
+# 逐轮 review 才发现的新入口。家族模式按「模块 × 方法前缀」定义能力，
+# 与平台无关（静态 AST 分析），新方法名自动落入同一能力族：
+#
+#   ("module", "prefix")  → 该模块下所有以 prefix 开头的方法 = 命令执行
+#   ("module", None)      → 该模块**任意**方法 = 命令执行（subprocess 全模块）
+#
+# 边界说明：multiprocessing.Process / os.fork 创建进程但**不执行外部
+# 程序**（target 是脚本内函数），且 multiprocessing.Pool 数据并行是合法
+# 用途——不归入命令执行族（避免误报），由运行时边界管控。
+_EXEC_CODE_COMMAND_EXEC_PREFIXES = (
+    ("os", "spawn"),    # os.spawnl/le/lp/lpe/v/ve/vp/vpe
+    ("os", "exec"),     # os.execv/ve/vp/vpe/l/le/lp/lpe（进程替换）
+    ("posix", "spawn"),  # os 的底层实现模块（直接 import posix 时）
+    ("posix", "exec"),
+    ("asyncio", "create_subprocess_"),  # exec + shell 两入口
+)
+_EXEC_CODE_COMMAND_EXEC_MODULES = frozenset({"subprocess"})
+
+# open 形状（2026-08-28 re-review Blocker 2 根因修复的等效面）：内置 open
+# 不是唯一接受路径+写模式的 stdlib writer——io.open 与内置同签名（file），
+# codecs.open 用 filename。统一按签名解析目标与 mode，不再假设 builtin
+# open 是全部能力。值为 file 参数的关键字名（位置 0 或该关键字）。
+_EXEC_CODE_OPEN_SHAPES = {
+    ("builtins", "open"): "file",
+    ("io", "open"): "file",
+    ("codecs", "open"): "filename",
+}
+
+
+def _match_command_exec_family(m, a) -> str | None:
+    """精确名字表之外的命令执行家族匹配（前缀 / 模块级规则）。
+
+    2026-08-28 re-review Blocker 3：asyncio.create_subprocess_exec、
+    os.startfile、pty.spawn 曾因不在精确表而静默放行。家族规则使任何
+    落入「模块 × 前缀」能力族的方法都返回 command-exec，不依赖逐名枚举。
+    """
+    for mod, prefix in _EXEC_CODE_COMMAND_EXEC_PREFIXES:
+        if m == mod and a is not None and a.startswith(prefix):
+            return "command-exec"
+    if m in _EXEC_CODE_COMMAND_EXEC_MODULES:
+        return "command-exec"
+    return None
 
 # =========================================================================
 # Layer 3 — Hard Block: Self-Destructive / Process-Killing Operations
@@ -204,8 +261,11 @@ def _resolve_binding_expr(expr, imports, raw_aliases, seen=None, known=None):
     if isinstance(expr, ast.Name):
         if expr.id in _EXEC_CODE_DANGEROUS_BUILTINS:
             return ("builtins", expr.id)
-        if expr.id in imports:
-            return imports[expr.id]
+        # 候选保留模型（2026-08-28）：import 候选可能多个，known 非 None
+        # 时危险优先（任一候选命中 known 即返回），否则取第一个候选。
+        _r = _resolve_import(expr.id, imports, known)
+        if _r is not None:
+            return _r
         if expr.id in seen:
             return None  # 循环别名（a=b; b=a）— 放弃，保守不误报
         seen.add(expr.id)
@@ -234,10 +294,8 @@ def _resolve_binding_expr(expr, imports, raw_aliases, seen=None, known=None):
 
     # killer = os.kill / b = a.kill / h = p.expanduser（p = os.path）
     if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
-        base = None
-        if expr.value.id in imports:
-            base = imports[expr.value.id]
-        else:
+        base = _resolve_import(expr.value.id, imports, known)
+        if base is None:
             base = _resolve_binding_expr(expr.value, imports, raw_aliases, seen, known)
         if base:
             m, a = base
@@ -254,8 +312,7 @@ def _resolve_binding_expr(expr, imports, raw_aliases, seen=None, known=None):
     if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Attribute):
         inner = expr.value
         if (inner.attr == "path" and isinstance(inner.value, ast.Name)
-                and inner.value.id in imports
-                and imports[inner.value.id][0] == "os"):
+                and _import_is_module(inner.value.id, "os", imports)):
             return ("os.path", expr.attr)
         if (inner.attr == "path" and isinstance(inner.value, ast.Name)
                 and _resolve_binding_expr(inner.value, imports, raw_aliases, seen, known)
@@ -268,8 +325,9 @@ def _resolve_binding_expr(expr, imports, raw_aliases, seen=None, known=None):
         obj_expr, attr_expr = _getattr_args(expr)
         if obj_expr is not None and isinstance(obj_expr, ast.Name):
             m = None
-            if obj_expr.id in imports:
-                m = imports[obj_expr.id][0]
+            _r = _resolve_import(obj_expr.id, imports, known)
+            if _r is not None:
+                m = _r[0]
             else:
                 base = _resolve_binding_expr(obj_expr, imports, raw_aliases, seen, known)
                 if base:
@@ -366,8 +424,9 @@ def _resolve_subscript_expr(expr, imports, raw_aliases, seen=None, known=None):
     if (isinstance(val, ast.Attribute) and val.attr == "__dict__"
             and isinstance(val.value, ast.Name)):
         m = None
-        if val.value.id in imports:
-            m = imports[val.value.id][0]
+        _r = _resolve_import(val.value.id, imports, known)
+        if _r is not None:
+            m = _r[0]
         else:
             base = _resolve_binding_expr(val.value, imports, raw_aliases, seen, known)
             if base:
@@ -390,21 +449,21 @@ def _resolve_subscript_expr(expr, imports, raw_aliases, seen=None, known=None):
     # sys.modules['os'] — 模块表查询（折叠后字符串 → 该模块）
     if (isinstance(val, ast.Attribute) and val.attr == "modules"
             and isinstance(val.value, ast.Name)
-            and val.value.id in imports
-            and imports[val.value.id][0] == "sys"
+            and _import_is_module(val.value.id, "sys", imports)
             and slice_str is not None):
         return (slice_str, None)
     # globals()['os'] — 仅当名字是脚本显式 import（否则无法静态判定内容）
     if (isinstance(val, ast.Call) and getattr(val.func, "id", None) == "globals"
             and not val.args and slice_str is not None
             and slice_str in imports):
-        return imports[slice_str]
+        return _resolve_import(slice_str, imports, known)
     # vars(os)['kill'] — vars(x) 等价 x.__dict__
     if (isinstance(val, ast.Call) and getattr(val.func, "id", None) == "vars"
             and val.args and isinstance(val.args[0], ast.Name)):
         m = None
-        if val.args[0].id in imports:
-            m = imports[val.args[0].id][0]
+        _r = _resolve_import(val.args[0].id, imports, known)
+        if _r is not None:
+            m = _r[0]
         else:
             base = _resolve_binding_expr(val.args[0], imports, raw_aliases, seen, known)
             if base:
@@ -455,8 +514,9 @@ def _resolve_attribute_chain(expr, imports, raw_aliases, seen=None, known=None):
     之外还有 ``os.path.expanduser(...)`` 内联形式）解析失败。
     """
     if isinstance(expr, ast.Name):
-        if expr.id in imports:
-            return imports[expr.id]
+        _r = _resolve_import(expr.id, imports, known)
+        if _r is not None:
+            return _r
         return _resolve_alias_value(expr.id, imports, raw_aliases, seen, known)
     if isinstance(expr, ast.Attribute):
         base = _resolve_attribute_chain(expr.value, imports, raw_aliases, seen, known)
@@ -476,12 +536,12 @@ def _expr_is_path_constructor(expr, imports, raw_aliases):
     if isinstance(f, ast.Name):
         if f.id == "Path":
             return True
-        if f.id in imports:
-            return imports[f.id][0] == "pathlib"
+        if _import_is_module(f.id, "pathlib", imports):
+            return True
         return _resolve_alias_value(f.id, imports, raw_aliases) == ("pathlib", "Path")
     if isinstance(f, ast.Attribute) and f.attr == "Path" and isinstance(f.value, ast.Name):
-        if f.value.id in imports:
-            return imports[f.value.id][0] == "pathlib"
+        if _import_is_module(f.value.id, "pathlib", imports):
+            return True
         return _resolve_alias_value(f.value.id, imports, raw_aliases) == ("pathlib", None)
     return False
 
@@ -510,7 +570,9 @@ def _collect_exec_code_bindings(code):
     """Pass 1：收集脚本的 import / star-import / 赋值别名绑定。
 
     返回 ``(imports, star_modules, raw_aliases)``：
-      - imports:      {local_name: (module, attr_or_None)}
+      - imports:      {local_name: list[(module, attr_or_None)]} — **候选
+                      列表**。同名多次绑定（含不同作用域）永不覆盖，全部
+                      候选入列；解析时任一候选命中危险目标即拦截。
       - star_modules: set[str] — ``from X import *`` 的模块名集合
       - raw_aliases:  {local_name: list[ast.expr]} — 赋值 RHS 原始表达式
                       列表。同名多次赋值保留**全部候选**（而非
@@ -524,27 +586,31 @@ def _collect_exec_code_bindings(code):
         第一次迭代即执行，取第一个可解析元素是正确且保守的）
 
     2026-08-25 re-review（andrexibiza Blocker 1）——作用域与控制流修正：
-      - **嵌套作用域不污染模块级**：``def shadow(): import math as os``
-        曾覆盖顶层 ``imports[\"os\"]``，使顶层 ``os.kill(...)`` 被解析成
-        math.kill 而放行（运行时嵌套 import 不影响模块级 os）。现在
-        import 绑定记录来源深度，外层/同深度后写优先，嵌套同名不覆盖
-        模块级；但模块级无同名时嵌套绑定仍收集（防漏函数内真实危险
-        导入）。star-import 同策略。
       - **静态不可达分支跳过**：``if False:`` / ``while False:`` 的 body
         不再写入绑定（``if False: killer = print`` 曾覆盖 killer =
         os.kill，使可达的 ``killer(...)`` 丢失危险身份）。
       - **同名多次赋值保留全部候选**：顺序赋值/分支赋值一律 append，
         解析时取第一个可解析候选（保守方向：任一候选危险即拦截）。
+
+    2026-08-28 re-review（andrexibiza Blocker 1 根因修复）——import 绑定
+    从「单值 + depth 覆盖」改为「候选保留」：
+      - depth（数值）不是词法作用域身份：``def dangerous(): import os``
+        与 ``def harmless(): import math as os`` 同 depth，后写覆盖先写
+        把 dangerous 的 os.kill 解析成 math.kill → 硬阻断漏拦。任何
+        ``depth <= prev`` 覆盖规则都无法区分兄弟作用域——根因是「名字→
+        单值」的丢失性模型。现在同名绑定全部入列（去重），解析时任一
+        候选命中危险目标即拦截（conservatively retain every possible
+        dangerous target）。嵌套作用域绑定不再覆盖模块级绑定（两者都是
+        候选，模块级的危险候选依然可见），同时函数内真实危险导入也不会
+        因模块级同名安全导入而被遮蔽。
     """
     try:
         tree = ast.parse(code)
     except SyntaxError:
         return {}, set(), {}
-    imports: dict = {}
+    imports: dict = {}   # local_name -> list[(module, attr)] 候选列表
     star_modules: set = set()
     raw_aliases: dict = {}
-    import_depths: dict = {}   # local_name -> 绑定作用域深度（0=模块级）
-    star_depths: dict = {}     # top_module -> 绑定作用域深度
 
     def _const_truthiness(node):
         """字面量常量的真值（False/0/''/None/[] 等）；无法静态判定返回 None。"""
@@ -553,18 +619,22 @@ def _collect_exec_code_bindings(code):
         return None
 
     def _record_import(name, module, attr, depth):
-        # 外层/同深度后写优先；嵌套同名不覆盖模块级（review Blocker 1）。
-        prev = import_depths.get(name)
-        if prev is None or depth <= prev:
-            imports[name] = (module, attr)
-            import_depths[name] = depth
+        # 候选保留模型（2026-08-28 re-review Blocker 1 根因修复）：同名绑定
+        # **永不覆盖**——同深度兄弟作用域（``def dangerous(): import os`` +
+        # ``def harmless(): import math as os``）曾因后写覆盖先写而把
+        # dangerous 里的 os.kill 解析成 math.kill 放行。depth 是数值不是
+        # 词法作用域身份，任何 ``depth <= prev`` 覆盖规则都无法区分兄弟
+        # 作用域。现在全部候选入列，解析时任一候选命中危险目标即拦截
+        # （conservatively retain every possible dangerous target）。
+        # 去重：同一 (name, module, attr) 只保留一个候选。
+        cand = (module, attr)
+        existing = imports.setdefault(name, [])
+        if cand not in existing:
+            existing.append(cand)
 
     def _record_star(module, depth):
         top = module.split(".")[0]
-        prev = star_depths.get(top)
-        if prev is None or depth <= prev:
-            star_modules.add(top)
-            star_depths[top] = depth
+        star_modules.add(top)
 
     def _visit(node, depth):
         # ── 函数/类/lambda 体是独立作用域：body 内绑定 depth+1 ──────
@@ -662,6 +732,38 @@ def _collect_exec_code_bindings(code):
     return imports, star_modules, raw_aliases
 
 
+def _import_candidates(name, imports):
+    """返回 *name* 的全部 import 候选 ``[(module, attr)]``（候选保留模型）。
+
+    2026-08-28 re-review Blocker 1 根因修复：imports 从「名字→单值」改为
+    「名字→候选列表」，解析时必须考虑**全部**候选——任一候选命中危险
+    目标即拦截，防止兄弟/嵌套作用域的同名绑定互相遮蔽。
+    """
+    return imports.get(name, ()) if isinstance(imports, dict) else ()
+
+
+def _resolve_import(name, imports, known=None):
+    """把 *name* 的 import 候选列表解析为单个 ``(module, attr)``。
+
+    ``known`` 非 None 时**危险优先**：任一候选命中 ``known`` 即返回（防止
+    安全候选遮蔽危险候选——与 raw_aliases 的候选解析语义一致）；否则返回
+    第一个候选。无候选返回 None。
+    """
+    cands = _import_candidates(name, imports)
+    if not cands:
+        return None
+    if known:
+        for c in cands:
+            if c in known:
+                return c
+    return cands[0]
+
+
+def _import_is_module(name, module, imports):
+    """*name* 的任一 import 候选的首模块是 *module*（多候选任一命中即真）。"""
+    return any(c[0] == module for c in _import_candidates(name, imports))
+
+
 def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
     """把 ast.Call 的 func 解析为规范化 (module, attr)，失败返回 None。
 
@@ -684,19 +786,21 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
     # ── ast.Name: kill(...) ──
     if isinstance(func, ast.Name):
         name = func.id
-        # imports 绑定也是候选（2026-08-28 拆解：``from os import kill;
-        # if cond: kill = os.path.join; kill(...)`` 的 kill 同时有 import
+        # imports 绑定也是候选（2026-08-28 拆解：from os import kill;
+        # if cond: kill = os.path.join; kill(...) 的 kill 同时有 import
         # 绑定 ("os","kill") 和赋值候选 os.path.join——先查 imports 危险
-        # 命中，防止赋值别名把 import 危险绑定遮蔽掉）。
-        if name in imports:
-            m, a = imports[name]
+        # 命中，防止赋值别名把 import 危险绑定遮蔽掉）。候选保留模型
+        # （2026-08-28 re-review Blocker 1）：遍历**全部** import 候选，
+        # 任一命中 known 即返回——兄弟/嵌套作用域的同名绑定不再互相遮蔽。
+        for m, a in _import_candidates(name, imports):
             if a is not None and (m, a) in known:
                 return (m, a)
         alias = _resolve_alias_value(name, imports, raw_aliases, None, known)
         if alias is not None:
             return alias
-        if name in imports:
-            m, a = imports[name]
+        _r = _resolve_import(name, imports, known)
+        if _r is not None:
+            m, a = _r
             return (m, a) if a is not None else None
         for mod in star_modules:  # from os import *; kill(...)
             if (mod, name) in known:
@@ -715,9 +819,10 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
         if isinstance(base, ast.Name):
             if base.id == "Path":
                 return ("pathlib", attr)
-            if base.id in imports:
-                resolved_base = imports[base.id]
-            else:
+            # 候选保留模型：任一 import 候选命中 known 即优先（危险优先），
+            # 否则取第一个候选；都没有再走赋值别名。
+            resolved_base = _resolve_import(base.id, imports, known)
+            if resolved_base is None:
                 # 赋值别名：killer = os.kill 的 base 是 os；o.kill 的 base 是 o；
                 # p.expanduser 的 base 是 p（p = os.path，组合属性）
                 resolved_base = _resolve_alias_value(
@@ -764,8 +869,9 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
             obj_expr, attr_expr = _getattr_args(func)
             if obj_expr is not None and isinstance(obj_expr, ast.Name):
                 m = None
-                if obj_expr.id in imports:
-                    m = imports[obj_expr.id][0]
+                _r = _resolve_import(obj_expr.id, imports, known)
+                if _r is not None:
+                    m = _r[0]
                 else:
                     alias = _resolve_alias_value(
                         obj_expr.id, imports, raw_aliases, None, known)
@@ -788,8 +894,9 @@ def _resolve_call_target(func, imports, star_modules, raw_aliases, known):
                 if (isinstance(base, ast.Attribute) and base.attr == "__dict__"
                         and isinstance(base.value, ast.Name)):
                     m = None
-                    if base.value.id in imports:
-                        m = imports[base.value.id][0]
+                    _r = _resolve_import(base.value.id, imports, known)
+                    if _r is not None:
+                        m = _r[0]
                     else:
                         alias = _resolve_alias_value(
                             base.value.id, imports, raw_aliases, None, known)
@@ -989,9 +1096,11 @@ def _execute_code_has_dangerous_ops(code: str):
     imports, star_modules, raw_aliases = _collect_exec_code_bindings(code)
 
     # ── 可疑模块整体导入（ctypes）────────────────────────────
-    for _local_name, (_module, _attr) in imports.items():
-        if _module in _EXEC_CODE_SUSPICIOUS_IMPORTS:
-            return "ctypes-import"
+    # 候选保留模型：imports[name] 是候选列表，遍历全部候选。
+    for _cands in imports.values():
+        for (_module, _attr) in _cands:
+            if _module in _EXEC_CODE_SUSPICIOUS_IMPORTS:
+                return "ctypes-import"
 
     try:
         tree = ast.parse(code)
@@ -1008,10 +1117,11 @@ def _execute_code_has_dangerous_ops(code: str):
             func, imports, star_modules, raw_aliases, _EXEC_CODE_DANGEROUS_CALLS
         )
 
-        # 内置 open() — 区分读写模式（只读放行，写拦截）。resolved 覆盖
-        # 直接调用、``op = open`` 赋值别名、``from builtins import open as op``
-        # （2026-08-25 复现：赋值别名曾绕过此检测）。
-        if resolved == ("builtins", "open"):
+        # open 形状（builtin open + io.open + codecs.open，2026-08-28
+        # Blocker 2 等效面）——区分读写模式（只读放行，写拦截）。resolved
+        # 覆盖直接调用、``op = open`` 赋值别名、``from builtins import
+        # open as op``（2026-08-25 复现：赋值别名曾绕过此检测）。
+        if resolved in _EXEC_CODE_OPEN_SHAPES:
             if _open_mode_is_write(node):
                 return "open-write"
             continue  # 只读 open，放行
@@ -1028,13 +1138,19 @@ def _execute_code_has_dangerous_ops(code: str):
         if resolved is None:
             continue
         m, a = resolved
-        if (m, a) in _EXEC_CODE_DANGEROUS_CALLS:
+        reason = _EXEC_CODE_DANGEROUS_CALLS.get((m, a))
+        if reason is None:
+            # 命令执行家族模式匹配（2026-08-28 Blocker 3 根因修复）：
+            # asyncio.create_subprocess_* / os.startfile / pty.spawn 曾
+            # 不在精确名字表 → 本地 yolo/approvals-off 路径静默执行。
+            reason = _match_command_exec_family(m, a)
+        if reason is not None:
             if (m, a) == ("pathlib", "open"):
                 # Path.open 的 mode 是第一个位置参数，需单独判断读写
                 if _path_open_mode_is_write(node):
                     return "open-write"
                 continue  # 只读 Path.open，放行
-            return _EXEC_CODE_DANGEROUS_CALLS[(m, a)]
+            return reason
 
     return None
 
@@ -1243,15 +1359,23 @@ def _resolve_expr_path(expr, raw_aliases, imports) -> str | None:
     return None
 
 
-def _resolve_static_write_target(node: ast.Call, raw_aliases, imports) -> str | None:
-    """Try to resolve an open()/Path() first-arg target to a literal path.
+def _resolve_static_write_target(node: ast.Call, raw_aliases, imports,
+                                 file_kw: str = "file") -> str | None:
+    """解析 open 形状调用的写目标路径。
 
-    Thin wrapper over ``_resolve_expr_path`` for the legacy call shape
-    (first positional argument).
+    按签名解析（2026-08-28 re-review Blocker 2 根因修复）：内置 open 的
+    ``file`` 是签名参数——位置 0 **或关键字 file=**。此前只解析位置参数，
+    ``open(file=\"/root/.hermes/config.yaml\", mode=\"w\")`` 的目标无法
+    恢复 → 敏感写不变量降级为可恢复审批（yolo/approvals-off 击穿）。
+    ``file_kw`` 是 open 形状的 file 参数关键字名（builtins/io 是 ``file``，
+    codecs.open 是 ``filename``，见 ``_EXEC_CODE_OPEN_SHAPES``）。
     """
-    if not node.args:
-        return None
-    return _resolve_expr_path(node.args[0], raw_aliases, imports)
+    if node.args:
+        return _resolve_expr_path(node.args[0], raw_aliases, imports)
+    for kw in node.keywords:
+        if kw.arg == file_kw:
+            return _resolve_expr_path(kw.value, raw_aliases, imports)
+    return None
 
 
 def _resolve_path_ctor_target(ctor: ast.Call, raw_aliases, imports) -> str | None:
@@ -1333,10 +1457,14 @@ def _execute_code_has_sensitive_write(code: str) -> str | None:
         )
 
         # builtin open(...) / open(file, mode) with write mode
-        # （resolved 覆盖 op = open 别名 / from builtins import open as op）
-        if resolved == ("builtins", "open"):
+        # （resolved 覆盖 op = open 别名 / from builtins import open as op；
+        # 2026-08-28 Blocker 2 根因修复：io.open / codecs.open 同属 open
+        # 形状——file 参数按签名解析，位置 0 或关键字 file=/filename=）
+        if resolved in _EXEC_CODE_OPEN_SHAPES:
             if _open_mode_is_write(node):
-                target = _resolve_static_write_target(node, raw_aliases, imports)
+                file_kw = _EXEC_CODE_OPEN_SHAPES[resolved]
+                target = _resolve_static_write_target(node, raw_aliases, imports,
+                                                      file_kw)
                 if target and _write_target_is_sensitive(target):
                     return target
             continue
@@ -1416,10 +1544,11 @@ def _execute_code_touches_sensitive_path(code: str) -> str | None:
             continue
         # open()/Path() 写形状已在 _execute_code_has_sensitive_write 单独
         # 处理；这里跳过避免重复判定（其只读形态合法，不升级）。
+        # 2026-08-28 Blocker 2：io.open/codecs.open 同属 open 形状。
         resolved = _resolve_call_target(
             func, imports, star_modules, raw_aliases, _EXEC_CODE_DANGEROUS_CALLS
         )
-        if resolved in (("builtins", "open"), ("pathlib", "open")):
+        if resolved in _EXEC_CODE_OPEN_SHAPES or resolved == ("pathlib", "open"):
             continue
         # pathlib 变异方法（unlink/touch/chmod/rename/replace/...）的目标
         # 可能是 receiver（sensitive_write 处理）或参数（这里处理）——
