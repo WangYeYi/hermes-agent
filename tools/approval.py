@@ -2565,6 +2565,48 @@ def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:
     return contains_gateway_lifecycle_command(command)
 
 
+def _self_pid_set() -> frozenset:
+    """Hermes 自身 + 父进程的 PID 集合（kill 数字 PID 自终止判定）。"""
+    pids = {os.getpid()}
+    try:
+        pids.add(os.getppid())
+    except (OSError, AttributeError):
+        pass
+    return frozenset(pids)
+
+
+# kill <numeric-pid> 形状（排除 kill -l 信号列表查询）。裸数字 PID 的
+# kill 是否危险取决于目标：普通 PID（reap 自己 spawn 的子进程）放行，
+# 目标是 Hermes 自身/父进程 → 拦截（#74078 Part 1，jeff-mettel 窄方案：
+# 不 gate 全部数字 PID kill——上游 test_safe_kill_pid_not_flagged 故意
+# 放行普通 PID，因为 agent 常需清理自己启动的进程）。
+_KILL_NUMERIC_PID_RE = re.compile(
+    r"\bkill\b(?!\s+-[lL]\b)"
+    r"(?:\s+-[^\s]+(?:\s+[^\s]+)?)?\s+\d+")
+
+
+def _kill_targets_own_process(command: str) -> bool:
+    """kill <numeric-pid> 且任一目标 PID 是 Hermes 自身或父进程 → True。
+
+    仅作 detect_dangerous_command 的前置补充检查：普通 PID 放行
+    （保持上游 test_safe_kill_pid_not_flagged），自身/父进程 PID
+    拦截（自终止守卫的裸 PID 缺口，#74078 Part 1）。
+    """
+    if not _KILL_NUMERIC_PID_RE.search(command.lower()):
+        return False
+    own = _self_pid_set()
+    # 提取 kill 命令后出现的所有数字 token 作为候选 PID
+    rest = command.lower().split("kill", 1)[-1] if "kill" in command.lower() else ""
+    for token in re.findall(r"\d+", rest):
+        try:
+            pid = int(token)
+        except ValueError:
+            continue
+        if pid in own:
+            return True
+    return False
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
 
@@ -2575,6 +2617,10 @@ def detect_dangerous_command(command: str) -> tuple:
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
+    # 自终止裸 PID 缺口（#74078 Part 1）：kill <自身/父 PID> 前置拦截，
+    # 普通 PID 放行（保持上游 test_safe_kill_pid_not_flagged）。
+    if _kill_targets_own_process(command):
+        return (True, "kill own process", "kill own process (self-termination)")
 
     for command_variant in _command_detection_variants(command):
         command_lower = command_variant.lower()
