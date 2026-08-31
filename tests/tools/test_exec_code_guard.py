@@ -973,10 +973,73 @@ def test_package_acquisition_owner_gated_in_isolated_backends(env_type):
     'import subprocess\nsubprocess.run(["git", "clone", "https://example.com/x"])',
     'import subprocess\nsubprocess.run(["python", "-c", "print(1+1)"])',
     'import subprocess\nsubprocess.run("echo \'pip install x\'", shell=True)',
-    # 静态不可解析参数 → 不确认 → 放行（留给运行时边界）
-    'import subprocess\nsubprocess.run(cmd, shell=True)',
     # 非命令执行调用（读文件等）
     'import subprocess\nsubprocess.run(["cat", "/etc/hostname"])',
 ])
 def test_package_acquisition_benign_passes(code):
+    assert _execute_code_has_package_acquisition(code) is None
+
+
+# fail-closed（P0-3，对齐 #98138 bounded 设计）：command-exec 调用存在但
+# argv 静态不可解析 → 无法判定是否包获取 → 返回 _PACKAGE_UNRESOLVABLE
+# 要求 owner 审批，不再放行（旧语义「不确认 → 放行」已废弃，见 #97657
+# owner-gate + yolo/off 不可绕过）。
+@pytest.mark.parametrize("code", [
+    'import subprocess\nsubprocess.run(cmd, shell=True)',
+    'import os\nos.system(os.environ["CMD"])',
+    'import subprocess\nargs = get_args()\nsubprocess.run(args)',
+])
+def test_package_acquisition_unresolvable_fails_closed(code):
+    from tools.exec_code_policy import _PACKAGE_UNRESOLVABLE
+    assert _execute_code_has_package_acquisition(code) == _PACKAGE_UNRESOLVABLE
+
+
+# ─────────────────────────────────────────────────────────────────────
+# exec*/spawn* 签名感知提取（P1 修复，andrexibiza 2026-08-29 P1）
+# ─────────────────────────────────────────────────────────────────────
+# 此前 node.args[-1] 一刀切把 argv 当最后位置参数：execve/spawnve/
+# posix_spawn 的最后参数是 env → 全部漏检。现按各家族真实签名提取
+# argv 槽位，并以 path 参数（真实可执行文件）做权威判定，argv[0]
+# 仅作辅助（防 argv[0] 伪造绕过）。所有检测用例在 c8e072d01c 上
+# 漏检（None），修复后全部返回包管理器名。
+
+EXEC_SPAWN_ACQUISITION_CASES = [
+    # *e 家族：最后参数是 env，不是 argv（P1 三个复现例）
+    "import os\nos.execve(\"/usr/bin/pip\", [\"pip\", \"install\", \"pkg\"], os.environ)",
+    "import os\nos.spawnve(os.P_WAIT, \"/usr/bin/pip\", [\"pip\", \"install\", \"pkg\"], os.environ)",
+    "import os\nos.posix_spawn(\"/usr/bin/pip\", [\"pip\", \"install\", \"pkg\"], os.environ)",
+    "import os\nos.posix_spawnp(\"/usr/bin/pip\", [\"pip\", \"install\", \"pkg\"], os.environ)",
+    "import os\nos.execvpe(\"/usr/bin/pip\", [\"pip\", \"install\", \"pkg\"], os.environ)",
+    "import os\nos.spawnvpe(os.P_WAIT, \"/usr/bin/pip\", [\"pip\", \"install\", \"pkg\"], os.environ)",
+    # argv[0] 伪造：真实执行文件在 path 参数（P1 权威源问题）
+    "import os\nos.execve(\"/usr/bin/pip\", [\"harmless-name\", \"install\", \"pkg\"], os.environ)",
+    # *l 家族：变长位置尾部
+    "import os\nos.execl(\"/usr/bin/pip\", \"pip\", \"install\", \"pkg\")",
+    "import os\nos.execle(\"/usr/bin/pip\", \"pip\", \"install\", \"pkg\", os.environ)",
+    "import os\nos.execlp(\"/usr/bin/pip\", \"pip\", \"install\", \"pkg\")",
+    "import os\nos.spawnl(os.P_WAIT, \"/usr/bin/pip\", \"pip\", \"install\", \"pkg\")",
+    "import os\nos.spawnle(os.P_WAIT, \"/usr/bin/pip\", \"pip\", \"install\", \"pkg\", os.environ)",
+    "import os\nos.spawnlp(os.P_WAIT, \"/usr/bin/pip\", \"pip\", \"install\", \"pkg\")",
+    # v 家族常规形状（回归确认不退化）
+    "import os\nos.execv(\"/usr/bin/pip\", [\"pip\", \"install\", \"pkg\"])",
+    "import os\nos.spawnv(os.P_WAIT, \"/usr/bin/pip\", [\"pip\", \"install\", \"pkg\"])",
+]
+
+@pytest.mark.parametrize("code", EXEC_SPAWN_ACQUISITION_CASES)
+def test_exec_spawn_signature_aware_detection(code):
+    """exec*/spawn*/posix_spawn 各家族按真实签名提取 argv，包获取
+    必须检出（P1 修复；c8e072d01c 上这些形状全部漏检）。"""
+    assert _execute_code_has_package_acquisition(code) is not None
+
+
+# 良性 exec/spawn 对照（签名感知不得引入误报）
+@pytest.mark.parametrize("code", [
+    "import os\nos.execv(\"/usr/bin/true\", [\"true\"])",
+    "import os\nos.execl(\"/bin/date\", \"date\", \"-u\")",
+    "import os\nos.spawnl(os.P_WAIT, \"/usr/bin/pip\", \"pip\", \"list\")",
+    "import os\nos.execve(\"/bin/date\", [\"date\"], os.environ)",
+    "import os\nos.posix_spawn(\"/usr/bin/true\", [\"true\"], os.environ)",
+    "import os\nos.execlp(\"/usr/bin/git\", \"git\", \"status\")",
+])
+def test_exec_spawn_benign_passes(code):
     assert _execute_code_has_package_acquisition(code) is None

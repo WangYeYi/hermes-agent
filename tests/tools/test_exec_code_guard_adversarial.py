@@ -44,6 +44,7 @@ from tools.approval import (
     check_execute_code_guard,
 )
 from tools.exec_code_policy import (
+    _execute_code_has_capability_leak,
     _execute_code_has_sensitive_write,
     _execute_code_touches_sensitive_path,
     _classify_exec_code_imports,
@@ -971,27 +972,81 @@ def test_capability_benign_non_sensitive_mutation_prompts_not_silent():
 # 属于 sandbox/运行时边界的职责（模块 docstring 已诚实声明）：
 # 跨函数数据流（def/lambda 返回）、非字面量可迭代、动态插值。
 # 若未来引入运行时沙箱，这些测试应翻转成普通断言。
+# 2026-08-31（P0-4 能力泄漏检测）：fn/lambda indirection、fn wrapper、
+# for non-literal iter 四个形状已由 _execute_code_has_capability_leak
+# 解决（能力在离开当前 cell 前被拦），移出本表，见 Section C2。
 # ═════════════════════════════════════════════════════════════════════════
 
 STATIC_BOUNDARY_RESIDUALS = [
-    # 跨函数数据流：需要过程间分析
-    ("fn indirection", "import os\ndef f():\n    return os.kill\nf()(os.getpid(), 15)"),
-    ("lambda indirection", "import os\nk = lambda: os.kill\nk()(os.getpid(), 15)"),
-    ("fn wrapper", "import os\ndef call(fn, *a):\n    return fn(*a)\ncall(os.kill, os.getpid(), 15)"),
-    # 非字面量 for 可迭代（运行时才知道 iterable 内容）
-    ("for non-literal iter", "import os\nfuncs = [os.kill]\nfor f in funcs:\n    f(os.getpid(), 15)"),
-    # 动态 f-string 插值（插值值静态不可解析）
+    # 动态 f-string 插值（插值值静态不可解析，且非 kill 能力——泄漏
+    # 检测不覆盖；敏感写目标同样解析不到插值后的路径）
     ("f-string unresolvable", "import os\nopen(f'{name}/.ssh/authorized_keys', 'w').write('x')"),
 ]
 
 @pytest.mark.parametrize("label,code", STATIC_BOUNDARY_RESIDUALS,
                          ids=[l for l, _ in STATIC_BOUNDARY_RESIDUALS])
-@pytest.mark.xfail(reason="静态分析边界（文档化残余）：跨函数数据流/运行时值需过程间分析或运行时沙箱，"
+@pytest.mark.xfail(reason="静态分析边界（文档化残余）：动态插值路径需运行时沙箱，"
                           "属 sandbox 边界职责，当前模块 docstring 已诚实声明。",
                    strict=False)
 def test_static_boundary_residual(label, code):
     """无法静态修复的形状——XFAIL 标注为文档化残余，不得误报为已修复。"""
     assert _execute_code_has_self_destructive_ops(code) is not None
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Section C2 — 能力泄漏（#94647 跨 cell 存储源头，2026-08-31 P0-4）
+# 硬阻断能力出现在非调用位置（return/赋值右值/容器元素/参数/lambda
+# 值体）→ 拦截。这些形状曾属 Section C XFAIL，能力泄漏检测使其可修：
+# cell 1 存不进能力，cell 2 的不透明间接调用即失去源头。
+# ═════════════════════════════════════════════════════════════════════════
+
+CAPABILITY_LEAK_SHAPES = [
+    ("fn indirection", "import os\ndef f():\n    return os.kill\nf()(os.getpid(), 15)"),
+    ("lambda value indirection", "import os\nk = lambda: os.kill\nk()(os.getpid(), 15)"),
+    ("fn wrapper arg", "import os\ndef call(fn, *a):\n    return fn(*a)\ncall(os.kill, os.getpid(), 15)"),
+    ("container storage", "import os\nfuncs = [os.kill]\nfor f in funcs:\n    f(os.getpid(), 15)"),
+    ("assignment storage", "import os\nkiller = os.kill"),
+    ("return only", "import os\ndef f():\n    return os.kill"),
+    ("star import storage", "from os import *\nsaved = kill"),
+    ("psutil method as value", "import psutil\ndef f():\n    return psutil.Process(1).terminate"),
+]
+
+@pytest.mark.parametrize("label,code", CAPABILITY_LEAK_SHAPES,
+                         ids=[l for l, _ in CAPABILITY_LEAK_SHAPES])
+def test_capability_leak_blocked(label, code):
+    """能力泄漏（非调用位置的硬阻断能力）必须被拦：检测函数返回原因，
+    guard 返回 hard_blocked（yolo/off 不可绕过，见 guard 级测试）。"""
+    assert _execute_code_has_capability_leak(code) is not None
+    result = check_execute_code_guard(code, env_type="local", has_host_access=False)
+    assert result["approved"] is False
+    assert result["outcome"] == "hard_blocked"
+
+
+def test_capability_leak_blocked_under_yolo():
+    """能力泄漏与 self-destructive 同级：--yolo / approvals.mode=off
+    不可覆盖（#94647 跨 cell 存储是默认路径 session kernel 下的风险，
+    yolo 不能把它交易掉）。"""
+    import tools.approval as ap
+    old = ap._YOLO_MODE_FROZEN
+    try:
+        ap._YOLO_MODE_FROZEN = True
+        code = "import os\ndef f():\n    return os.kill"
+        result = check_execute_code_guard(code, env_type="local", has_host_access=False)
+        assert result["approved"] is False
+        assert result["outcome"] == "hard_blocked"
+    finally:
+        ap._YOLO_MODE_FROZEN = old
+
+
+# 能力泄漏良性对照：调用位置不误报
+@pytest.mark.parametrize("code", [
+    "import os\nos.kill(123, 15)",                     # 直接调用
+    "import os, signal\nos.kill(123, signal.SIGKILL)",  # 常量作参数
+    "import os\npid = os.getpid()",                    # 无关调用
+    "from os import *\nkill(123)",                     # star 调用位置
+])
+def test_capability_leak_no_false_positive(code):
+    assert _execute_code_has_capability_leak(code) is None
 
 
 # ═════════════════════════════════════════════════════════════════════════

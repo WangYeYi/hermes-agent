@@ -5363,8 +5363,10 @@ def check_all_command_guards(command: str, env_type: str,
 from tools.exec_code_policy import (
     _execute_code_has_dangerous_ops,
     _execute_code_has_self_destructive_ops,
+    _execute_code_has_capability_leak,
     _execute_code_has_sensitive_write,
     _execute_code_has_package_acquisition,
+    _PACKAGE_UNRESOLVABLE,
     _execute_code_touches_sensitive_path,
     _exec_code_reason_text,
     _log_blocked_exec_code,
@@ -5414,6 +5416,34 @@ def check_execute_code_guard(code: str, env_type: str,
             "description": (
                 "execute_code self-destructive operation (hard blocked — "
                 "no approval path exists for statically matched calls)"
+            ),
+            "outcome": "hard_blocked",
+            "user_consent": False,
+        }
+
+    # ── Layer 3b: Capability leak (#94647) ────────────────────────────
+    # session kernel 跨 cell 绕过的 cell-1 源头：能力以值的形式被存储/
+    # 传递（return/赋值/容器/参数）而非直接调用——每 cell 单独扫描时
+    # 调用点不可见，cell 2 用不透明名称间接调用即绕过。能力泄漏检测
+    # 在能力「离开当前 cell」之前拦截（存不进去，跨 cell 调用链断开）。
+    # 与 self-destructive 同级：无审批路径、yolo/off 不可覆盖。
+    _leak_reason = _execute_code_has_capability_leak(code)
+    if _leak_reason is not None:
+        return {
+            "approved": False,
+            "message": (
+                f"HARD BLOCKED: {_leak_reason}. "
+                "Storing or passing a process-killing capability as a value "
+                "lets it escape per-cell static scanning and be invoked "
+                "indirectly in a later cell (#94647). There is no approval "
+                "path, bypass, or override for a statically matched leak. "
+                "Call the function directly in the same cell, or use normal "
+                "tool calls (terminal, read_file, write_file) instead."
+            ),
+            "pattern_key": "execute_code",
+            "description": (
+                "execute_code capability leak (hard blocked — cross-cell "
+                "capability persistence vector #94647)"
             ),
             "outcome": "hard_blocked",
             "user_consent": False,
@@ -5490,6 +5520,26 @@ def check_execute_code_guard(code: str, env_type: str,
     # (andrexibiza #97657 review: "the package decision occurring before
     # the generic container/YOLO/off short-circuits").
     _pkg = _execute_code_has_package_acquisition(code)
+    if _pkg == _PACKAGE_UNRESOLVABLE:
+        # fail-closed（P0-3）：进程启动调用存在但命令行静态不可解析，
+        # 无法排除包获取 → 要求 owner 精确审批，不放行（含 yolo/off）。
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: execute_code launches a process whose command "
+                "line cannot be statically resolved, so package acquisition "
+                "cannot be ruled out (#97657 owner gate, fail-closed). "
+                "Approve this exact operation explicitly, or run it through "
+                "the terminal tool where the command line is visible."
+            ),
+            "pattern_key": "package acquisition",
+            "description": (
+                "execute_code unresolvable process launch (owner-gated "
+                "fail-closed — cannot rule out package acquisition)"
+            ),
+            "outcome": "package_acquisition",
+            "user_consent": False,
+        }
     if _pkg is not None:
         return {
             "approved": False,
