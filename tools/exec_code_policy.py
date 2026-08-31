@@ -1101,6 +1101,50 @@ def _path_open_mode_is_write(call_node: ast.Call) -> bool:
     return True  # 变量/表达式，无法静态判定 → 保守拦截
 
 
+def _execute_code_has_capability_leak(code: str) -> str | None:
+    """检测硬阻断能力被「作为值存储/传递」而非直接调用（能力泄漏）。
+
+    #94647 session-kernel 跨 cell 绕过的 cell-1 源头：``def f(): return
+    os.kill`` 这类形状把能力以值的形式逃出当前 cell 的调用点扫描——
+    cell 1 只存能力不调用，cell 2 用不透明名称间接调用，每 cell 单独
+    扫描都判定安全。本函数解析每个 Name/Attribute 到硬阻断能力
+    （_HARD_BLOCKED_CALLS）；若其出现在**非调用位置**（return 值 /
+    赋值右值 / 容器元素 / 参数 / lambda 外的闭包捕获）→ 返回泄漏
+    描述——能力存不进去，跨 cell 调用链在源头断开。
+
+    调用位置（Call.func）由 _execute_code_has_self_destructive_ops
+    处理，这里不重复。运行时构造（eval("os.kill") 字符串、lambda 内
+    调用）超出静态边界 → XFAIL（sandbox/runtime 边界）。
+    """
+    imports, star_modules, raw_aliases = _collect_exec_code_bindings(code)
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    parent_map = {}
+    for p in ast.walk(tree):
+        for child in ast.iter_child_nodes(p):
+            parent_map[id(child)] = p
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Name, ast.Attribute)):
+            continue
+        resolved = _resolve_call_target(
+            node, imports, star_modules, raw_aliases, _HARD_BLOCKED_CALLS)
+        if resolved is None or resolved not in _HARD_BLOCKED_CALLS:
+            continue
+        parent = parent_map.get(id(node))
+        # 调用位置（Call.func）不算泄漏——由调用点检测处理
+        if isinstance(parent, ast.Call) and parent.func is node:
+            continue
+        return (
+            f"capability leak: {resolved[0]}.{resolved[1]} referenced as a "
+            f"value (returned/stored/passed) instead of called — cross-cell "
+            f"capability persistence vector (#94647); HARD BLOCKED so the "
+            f"capability cannot leave the current cell"
+        )
+    return None
+
+
 def _execute_code_has_dangerous_ops(code: str):
     """返回 execute_code 脚本中首个危险操作的 reason key（见
     ``_EXEC_CODE_DANGER_DETAILS``），无危险操作返回 None。
@@ -1858,6 +1902,54 @@ def _call_arg_expr(node: ast.Call, position: int, keyword: str | None):
     return None
 
 
+def _extract_exec_spawn_argv(m, a, node, raw_aliases, imports):
+    """签名感知提取 exec*/spawn* 家族的 (path, argv) 词表（P1 修复）。
+
+    os/posix 各家族的真实签名槽位：
+      execv/execve/execvp/execvpe:   path@0, argv@1, (env@2 for *e)
+      spawnv/spawnve/spawnvp/spawnvpe: mode@0, path@1, argv@2, (env@3)
+      posix.spawn/spawnp:            path@0, argv@1, env@2
+      execl/execlp:                  path@0, argv = args[1:]
+      execle/execlpe:                path@0, argv = args[1:-1] (尾 env)
+      spawnl/spawnlp:                mode@0, path@1, argv = args[2:]
+      spawnle/spawnlpe:              mode@0, path@1, argv = args[2:-1]
+
+    返回 (path_words, argv_words)：path_words 是真实可执行文件词表
+    （静态不可解析时 None，调用方降级用 argv[0] 判定）；argv_words
+    是该家族的 argv 词表（任一元素静态不可解析时返回 None）。
+    """
+    is_exec = a.startswith("exec")
+    is_posix_spawn = a in ("posix_spawn", "posix_spawnp") or (
+        m == "posix" and a in ("spawn", "spawnp"))
+    is_spawn = a.startswith("spawn") or is_posix_spawn
+    if not (is_exec or is_spawn):
+        return None, None
+    path_idx = 0 if (is_exec or is_posix_spawn) else 1  # spawn* 有 mode 前缀
+    path_expr = _call_arg_expr(node, path_idx, None)
+    path_words = _arg_to_argv(path_expr, raw_aliases, imports) if path_expr is not None else None
+    is_l = a.startswith("execl") or a.startswith("spawnl")
+    if is_l:
+        has_trailing_env = a.endswith("e")  # execle/execlpe/spawnle/spawnlpe
+        argv_exprs = node.args[path_idx + 1:-1 if has_trailing_env else None]
+    else:
+        # spawnv*(mode,path,argv) argv@2；execv*(path,argv)/posix.spawn(path,argv,env) argv@1
+        argv_idx = 2 if (a.startswith("spawn") and not is_posix_spawn) else 1
+        argv_expr = _call_arg_expr(node, argv_idx, None)
+        argv_exprs = [argv_expr] if argv_expr is not None else []
+    words = []
+    for e in argv_exprs:
+        part = _arg_to_argv(e, raw_aliases, imports)
+        if part is None:
+            return path_words, None
+        words.extend(part)
+    return path_words, (words or None)
+
+
+# fail-closed 标记（P0-3）：command-exec 调用存在但 argv 静态不可解析，
+# 无法判定是否包获取。返回此标记 → 调用方要求 owner 审批，不放行。
+_PACKAGE_UNRESOLVABLE = "?unresolvable-command-exec?"
+
+
 def _execute_code_has_package_acquisition(code: str) -> str | None:
     """返回脚本中静态可确认的包获取调用的包管理器名，否则 None。
 
@@ -1914,11 +2006,22 @@ def _execute_code_has_package_acquisition(code: str) -> str | None:
             if not ok:
                 words = None
         elif (m in ("os", "posix")
-              and (a.startswith("spawn") or a.startswith("exec"))):
-            # os.spawnv(mode, path, argv) / posix.spawn(path, argv, env) —
-            # argv 是最后一个位置参数（列表字面量）
-            if node.args:
-                words = _arg_to_argv(node.args[-1], raw_aliases, imports)
+              and (a.startswith("spawn") or a.startswith("exec")
+                   or a in ("posix_spawn", "posix_spawnp"))):
+            # 签名感知：*e 家族最后参数是 env 不是 argv；path 槽位
+            # 各族不同（P1 修复，此前 node.args[-1] 一刀切漏检
+            # execve/spawnve/posix_spawn）。path 参数是权威执行文件，
+            # 解析成功则用它覆盖 argv[0] 判定（防 argv[0] 伪造）。
+            path_words, words = _extract_exec_spawn_argv(
+                m, a, node, raw_aliases, imports)
+            if words and path_words:
+                words = [path_words[0]] + words
+        if words is None:
+            # fail-closed（P0-3，对齐 #98138 bounded 设计）：command-exec
+            # 调用存在但 argv 静态不可解析 → 无法判定是否包获取。不放行、
+            # 不跳过——交 owner 审批（yolo/off/容器路径在调用本函数之前
+            # 已被短路，这里返回的不可判定标记同样不可被它们绕过）。
+            return _PACKAGE_UNRESOLVABLE
         if not words:
             continue
         pkg = _package_words_are_acquisition(words)
