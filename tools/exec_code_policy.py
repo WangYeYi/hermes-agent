@@ -15,10 +15,12 @@ literals), star imports, ``getattr`` / ``__dict__`` dynamic access,
 ``sys.modules`` / ``globals()`` / ``vars()`` / ``__import__`` chains,
 ``functools.partial``, process-kill equivalents (``signal.kill`` /
 ``psutil.kill``), pathlib write methods, literal/expanduser/expandvars/
-f-string/join sensitive targets.  Code that builds calls at runtime
-(string-concatenated ``exec``, dynamic f-string interpolation, function/
-lambda/partial indirection through user-defined callables, non-literal
-for-iterables) is not statically visible and belongs to the
+f-string/join sensitive targets, and capability leak (hard-blocked
+capabilities referenced as values — return/assignment/container/
+argument — so they cannot escape per-cell scanning, #94647).  Code that
+builds calls at runtime (string-concatenated ``exec``, dynamic f-string
+path interpolation, lambda-body *calls* like ``lambda: os.kill()``,
+non-literal for-iterables) is not statically visible and belongs to the
 runtime/sandbox boundary.  Callers must not present ``hard_blocked`` as
 an unbypassable syscall-level property.
 """
@@ -1954,10 +1956,18 @@ def _execute_code_has_package_acquisition(code: str) -> str | None:
     """返回脚本中静态可确认的包获取调用的包管理器名，否则 None。
 
     只检查命令执行家族的调用（subprocess.* / os.system / os.popen /
-    os.spawn* / pty.spawn / asyncio.create_subprocess_* / posix.spawn*），
-    按调用形状提取 argv 后走 ``_package_words_are_acquisition`` 词表判定。
+    os.spawn* / os.exec* / os.posix_spawn* / pty.spawn /
+    asyncio.create_subprocess_*），按调用形状提取 argv 后走
+    ``_package_words_are_acquisition`` 词表判定。
+
     与 #97657 的 terminal 侧同一不变量：包获取必须 owner 精确单操作
     批准，容器/YOLO/approvals-off 均不可绕过（guard 在短路前调用本函数）。
+
+    返回语义（2026-08-31 P0-3 fail-closed）：
+      - 包管理器名     → 静态确认的包获取，调用方 owner-gate 拦截
+      - _PACKAGE_UNRESOLVABLE → command-exec 调用存在但 argv 静态不可
+        解析，无法排除包获取 → 调用方同样要求 owner 审批（不放行）
+      - None           → 无命令执行调用，或全部可解析且非包获取
     """
     imports, star_modules, raw_aliases = _collect_exec_code_bindings(code)
     try:
