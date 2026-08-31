@@ -1043,3 +1043,117 @@ def test_exec_spawn_signature_aware_detection(code):
 ])
 def test_exec_spawn_benign_passes(code):
     assert _execute_code_has_package_acquisition(code) is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 2026-08-31 举一反三：attrgetter / eval-字符串 / env-VAR=val / docker 子命令
+# 四个静态可见形状曾漏检（attrgetter 全层放行；eval 字符串只在审批层；
+# env 赋值与容器子命令在 yolo/off 下放行包获取）——现全部归位。
+# ─────────────────────────────────────────────────────────────────────
+
+# P1: operator.attrgetter 是 getattr 的函数式等价物——attrgetter("kill")(os)
+# 与已拦截的 getattr(os, "kill") 运行时等价，但能力名只以字符串字面量出现，
+# 曾全层放行（含 yolo/off）。attrgetter(lit) 应用于 os/sys 即硬阻断。
+@pytest.mark.parametrize("code", [
+    'import os\nfrom operator import attrgetter\nattrgetter("kill")(os)(1, 9)',
+    'import os\nimport operator\noperator.attrgetter("kill")(os)(1, 9)',
+    'import os as o\nfrom operator import attrgetter\nattrgetter("kill")(o)(1, 9)',
+    'from operator import attrgetter\nattrgetter("kill")(__import__("os"))(1, 9)',
+    'import os\nfrom operator import attrgetter\nattrgetter("killpg")(os)(0, 9)',
+])
+def test_attrgetter_on_os_hard_blocked(code):
+    assert _execute_code_has_self_destructive_ops(code) is not None
+
+
+def test_attrgetter_on_benign_object_passes():
+    """attrgetter 应用于非 os/sys 对象不误伤。"""
+    code = ('from operator import attrgetter\n'
+            'class A:\n    x = 1\n'
+            'a = A()\nattrgetter("x")(a)')
+    assert _execute_code_has_self_destructive_ops(code) is None
+
+
+@pytest.mark.parametrize("mode_gate", ["normal", "yolo", "off"])
+def test_attrgetter_kill_hard_blocked_in_all_modes(monkeypatch, mode_gate):
+    code = 'import os\nfrom operator import attrgetter\nattrgetter("kill")(os)(1, 9)'
+    import tools.approval as approval_module
+    if mode_gate == "yolo":
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    elif mode_gate == "off":
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["approved"] is False
+    assert result["outcome"] == "hard_blocked"
+
+
+# P2: eval/exec/compile 字符串字面量含 kill 家族 → 硬阻断。docstring 声称
+# 的覆盖此前缺失（只落审批层，yolo/off 放行）。
+@pytest.mark.parametrize("code", [
+    'eval("os.kill(1, 9)")',
+    'eval("os.kill")(1, 9)',
+    'exec("os.kill(1, 9)")',
+    'compile("os.kill(1, 9)", "x", "exec")',
+    'from os import kill\nexec("kill(1, 9)")',
+    'e = eval\ne("os.kill(1, 9)")',
+])
+def test_eval_exec_string_kill_hard_blocked(code):
+    assert _execute_code_has_self_destructive_ops(code) is not None
+
+
+def test_eval_benign_string_not_hard_blocked():
+    assert _execute_code_has_self_destructive_ops('eval("os.getpid()")') is None
+
+
+@pytest.mark.parametrize("mode_gate", ["normal", "yolo", "off"])
+def test_eval_string_kill_hard_blocked_in_all_modes(monkeypatch, mode_gate):
+    code = 'eval("os.kill(1, 9)")'
+    import tools.approval as approval_module
+    if mode_gate == "yolo":
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    elif mode_gate == "off":
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["approved"] is False
+    assert result["outcome"] == "hard_blocked"
+
+
+# P3/P4: env VAR=val 前缀 + 容器运行时子命令的包获取判定（曾漏检，
+# yolo/off 下放行 pip install）。
+@pytest.mark.parametrize("code", [
+    'import os\nos.system("env PATH=/x pip install x")',
+    'import os\nos.system("FOO=bar pip install y")',
+    'import subprocess\nsubprocess.run(["env", "PATH=/x", "pip", "install", "x"])',
+    'import subprocess\nsubprocess.run(["docker", "run", "img", "pip", "install", "x"])',
+    'import subprocess\nsubprocess.run(["docker", "exec", "c1", "pip", "install", "x"])',
+    'import subprocess\nsubprocess.run(["docker", "run", "--rm", "img", "pip", "install", "x"])',
+    'import subprocess\nsubprocess.run(["podman", "run", "img", "uv", "add", "x"])',
+])
+def test_wrapper_variant_package_acquisition_detected(code):
+    assert _execute_code_has_package_acquisition(code) is not None
+
+
+@pytest.mark.parametrize("code", [
+    'import os\nos.system("VAR=x echo hi")',
+    'import subprocess\nsubprocess.run(["docker", "run", "img", "echo", "hi"])',
+    'import subprocess\nsubprocess.run(["docker", "run", "img", "npm", "run", "build"])',
+    'import subprocess\nsubprocess.run(["docker", "pull", "img"])',
+    'import subprocess\nsubprocess.run(["docker", "images"])',
+])
+def test_wrapper_variant_benign_passes(code):
+    assert _execute_code_has_package_acquisition(code) is None
+
+
+@pytest.mark.parametrize("mode_gate", ["normal", "yolo", "off"])
+@pytest.mark.parametrize("code", [
+    'import os\nos.system("env PATH=/x pip install x")',
+    'import subprocess\nsubprocess.run(["docker", "exec", "c1", "pip", "install", "x"])',
+])
+def test_wrapper_variant_owner_gated_in_all_modes(monkeypatch, mode_gate, code):
+    import tools.approval as approval_module
+    if mode_gate == "yolo":
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    elif mode_gate == "off":
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+    result = check_execute_code_guard(code, env_type="local")
+    assert result["approved"] is False
+    assert result["outcome"] == "package_acquisition"

@@ -76,9 +76,15 @@ def test_sensitive_write_priority_over_open_write():
     assert "protected path" in result["message"]
 
 
-def test_eval_kill_is_dynamic_exec_not_hard_blocked(monkeypatch):
-    """eval(\"os.kill\") is dynamic-exec (prompt), NOT hard_blocked and NOT
-    auto-approved — per scope honesty."""
+def test_eval_kill_string_hard_blocked(monkeypatch):
+    """eval("os.kill") with a string literal is now HARD blocked (2026-08-31).
+
+    Previously dynamic-exec (approval prompt) only — the self-destructive
+    docstring claimed eval-with-literal coverage but the implementation
+    lacked it, so yolo/off auto-approved.  The literal is statically
+    visible, so the claim is now implemented: it never reaches the
+    approval surface, matching the direct os.kill contract.
+    """
     import tools.approval as approval_module
     monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
     monkeypatch.setattr(approval_module, "_is_single_query_approval_context", lambda: False)
@@ -87,8 +93,8 @@ def test_eval_kill_is_dynamic_exec_not_hard_blocked(monkeypatch):
     result = check_execute_code_guard(
         'import os\neval("os.kill")(os.getpid(), 15)', env_type="local"
     )
-    assert result.get("outcome") != "hard_blocked"
-    assert result["approved"] is False  # reaches the approval surface, not auto-approve
+    assert result.get("outcome") == "hard_blocked"
+    assert result["approved"] is False
 
 
 def test_hard_block_fires_before_container_skip():

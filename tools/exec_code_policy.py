@@ -224,6 +224,12 @@ _HARD_BLOCKED_CALLS = frozenset({
     ("psutil", "suspend"),
 })
 
+# eval/exec/compile 字符串字面量中的裸进程终止调用形态（2026-08-31 举一反三：
+# ``from os import kill; exec("kill(1, 9)")`` 的字符串无模块前缀——按调用名
+# 保守匹配；``kill -l`` 之类查询不在 execute_code 字符串语境出现，误伤可忽略。
+_KILL_CALL_IN_STR_RE = re.compile(
+    r"\b(kill|killpg|pthread_kill|terminate|send_signal|suspend)\s*\(")
+
 
 def _resolve_binding_expr(expr, imports, raw_aliases, seen=None, known=None):
     """解析赋值 RHS 表达式为规范化的 (module, attr) 元组。
@@ -970,12 +976,16 @@ def _execute_code_has_self_destructive_ops(code: str) -> str | None:
     import aliases, assignment aliases (incl. chains, walrus, tuple-unpack,
     for-targets), container subscripts, star imports, ``getattr`` /
     ``__dict__`` dynamic access, ``sys.modules`` / ``globals()`` /
-    ``vars()`` / ``__import__`` chains, ``functools.partial``, the
-    os.kill-equivalents ``signal.kill`` / ``signal.pthread_kill`` /
-    ``psutil.kill`` / ``psutil.Process(...).kill()``, and
-    ``eval("os.kill")`` with a string literal.  Code that builds the call
-    at runtime (string concatenation into ``exec``, calls routed through
-    user-defined functions/lambdas, non-literal for-iterables) is not
+    ``vars()`` / ``__import__`` chains, ``functools.partial``,
+    ``operator.attrgetter`` chains applied to os/sys (2026-08-31:
+    ``attrgetter("kill")(os)(1, 9)`` is runtime-equivalent to the blocked
+    ``getattr(os, "kill")`` form), the os.kill-equivalents ``signal.kill`` /
+    ``signal.pthread_kill`` / ``psutil.kill`` /
+    ``psutil.Process(...).kill()``, and ``eval``/``exec``/``compile`` with a
+    string literal containing a process-killing call.  Code that builds the
+    call at runtime (string concatenation into ``exec``, calls routed
+    through user-defined functions/lambdas, non-literal for-iterables,
+    ``attrgetter`` results bound to variables before application) is not
     statically visible.  That residual surface belongs to the
     runtime/sandbox boundary, not to this heuristic; the message returned
     to the model therefore does NOT claim an absolute "no bypass exists"
@@ -998,6 +1008,33 @@ def _execute_code_has_self_destructive_ops(code: str) -> str | None:
             node.func, imports, star_modules, raw_aliases, _HARD_BLOCKED_CALLS
         )
         if resolved is None:
+            # ── operator.attrgetter 链（2026-08-31 举一反三）──────────
+            # ``attrgetter("kill")(os)(1, 9)`` 与已拦截的
+            # ``getattr(os, "kill")(1, 9)`` 运行时完全等价，但能力名只以
+            # 字符串字面量出现，Name/Attribute 解析不可见 → 曾全层放行
+            # （含 yolo/off）。所有成分静态可见（字面量 + 模块名）→ 与
+            # getattr(os, ...) 保守拦截对齐：attrgetter(lit) 应用于
+            # os/sys 模块即拦（getter 是 operator.attrgetter，base 是
+            # os/sys 时等价动态属性访问，可能取到 kill/killpg）。
+            if isinstance(node.func, ast.Call):
+                outer = node.func  # attrgetter("kill")(os)
+                if isinstance(outer.func, ast.Call):
+                    getter = _resolve_call_target(
+                        outer.func.func, imports, star_modules,
+                        raw_aliases, _HARD_BLOCKED_CALLS)
+                    if getter == ("operator", "attrgetter"):
+                        for base_expr in outer.args:
+                            b = _resolve_binding_expr(
+                                base_expr, imports, raw_aliases, None,
+                                _HARD_BLOCKED_CALLS)
+                            if b is not None and b[0] in ("os", "sys"):
+                                return (
+                                    f"operator.attrgetter(...) applied to "
+                                    f"{b[0]} — dynamic attribute access may "
+                                    "resolve to a process-killing function "
+                                    "(HARD BLOCKED, no approval path; "
+                                    "use explicit calls instead)"
+                                )
             continue
         m, a = resolved
         if (m, a) in _HARD_BLOCKED_CALLS:
@@ -1005,6 +1042,28 @@ def _execute_code_has_self_destructive_ops(code: str) -> str | None:
                 f"{m}.{a}() — "
                 f"process-killing operation (HARD BLOCKED, no approval path)"
             )
+        # ── eval/exec/compile 字符串字面量含 kill 家族（2026-08-31 复现）──
+        # docstring 声称 eval("os.kill") string literal 是 HARD 覆盖形态，
+        # 但实现此前缺失——eval/exec 只落 DANG 层 dynamic-exec 审批，
+        # yolo/off 下放行。字面量字符串静态可见：含硬阻断能力调用即拦。
+        if (m, a) in (("builtins", "eval"), ("builtins", "exec"),
+                      ("builtins", "compile")):
+            if node.args and isinstance(node.args[0], ast.Constant) \
+                    and isinstance(node.args[0].value, str):
+                src = node.args[0].value
+                for _m2, _a2 in _HARD_BLOCKED_CALLS:
+                    if f"{_m2}.{_a2}" in src:
+                        return (
+                            f"{a} string literal contains {_m2}.{_a2}() — "
+                            "process-killing operation (HARD BLOCKED, "
+                            "no approval path)"
+                        )
+                # 裸名调用形态（from os import kill 后 exec("kill(1, 9)")）
+                if (_KILL_CALL_IN_STR_RE.search(src)):
+                    return (
+                        f"{a} string literal contains a process-killing "
+                        "call (HARD BLOCKED, no approval path)"
+                    )
         if a is None and m in ("os", "sys"):
             # getattr(os, dynamic_name)(...) — 动态属性名，静态无法判定具体
             # 函数，但 os/sys 的动态属性访问可能取到 kill/killpg。保守拦截：
@@ -1760,6 +1819,11 @@ _PACKAGE_EXEC_WRAPPERS = frozenset({
     "nerdctl", "cmd", "wsl",
 })
 
+# 环境赋值前缀（2026-08-31 举一反三）：``env PATH=/x pip install x`` /
+# ``FOO=bar pip install y`` 的 VAR=val 曾中断 wrapper 剥离 → exe 误判为
+# 赋值串 → 包获取漏检（yolo/off 下放行）。argv 已 lower()，名字全小写匹配。
+_ENV_ASSIGN_RE = re.compile(r"^[a-z_][a-z0-9_]*=")
+
 
 def _package_words_are_acquisition(words: list[str]) -> str | None:
     """判定 argv 词表是否为包获取命令；返回包管理器名，否则 None。
@@ -1771,8 +1835,31 @@ def _package_words_are_acquisition(words: list[str]) -> str | None:
     if not words:
         return None
     argv = [w.strip("\"'").lower() for w in words]
+    # 容器运行时子命令（2026-08-31 举一反三）：``docker run <img> pip
+    # install x`` / ``docker exec <c> pip install x`` 的 run/exec 曾把
+    # docker 当普通 wrapper 剥离 → exe 误判为 "run"/"exec" → 包获取漏检
+    # （yolo/off 下放行）。必须在剥离**之前**判断（docker 本身是 wrapper
+    # 名单成员）。剥离子命令 + flags + 一个目标参数（镜像名/容器名）后
+    # 递归判定剩余词表（容器内装包同属获取动作，owner-gate 不区分宿主/
+    # 容器边界；``docker pull`` 拉镜像是镜像而非包，不判定）。
+    if argv and argv[0] in ("docker", "podman", "nerdctl"):
+        if len(argv) >= 2 and argv[1] in ("run", "exec", "create", "start"):
+            rest = argv[2:]
+            while rest and rest[0].startswith("-"):
+                rest = rest[1:]
+            if rest:
+                rest = rest[1:]  # 镜像名/容器名
+            if rest:
+                return _package_words_are_acquisition(rest)
+        return None
     idx = 0
-    while idx < len(argv) and argv[idx] in _PACKAGE_EXEC_WRAPPERS:
+    # wrapper 前缀（sudo/env/...）+ 环境赋值（VAR=val）剥离。赋值
+    # 剥离 2026-08-31 举一反三：``env PATH=/x pip install x`` 的 PATH=/x
+    # 曾中断剥离（exe 误判为 "path=/x"）→ 包获取漏检。
+    while idx < len(argv) and (
+        argv[idx] in _PACKAGE_EXEC_WRAPPERS
+        or _ENV_ASSIGN_RE.match(argv[idx])
+    ):
         idx += 1
     if idx >= len(argv):
         return None
