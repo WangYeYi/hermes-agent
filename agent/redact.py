@@ -325,6 +325,136 @@ _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){0,2}")
 # E.164 phone numbers, 7-15 digits; the lookahead rejects hex strings / identifiers.
 _SIGNAL_PHONE_RE = re.compile(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")
 
+# 百度系登录态 cookie 名（__cas__st__3 / CPTK_585 / BDUSS / STOKEN 等）。
+# 这些 key 既不含通用 secret 关键词（token/key/password），值也不带已知
+# vendor 前缀（sk-/ghp_ 等），所以前缀、ENV、CFG 三路正则都不命中——百度
+# 竞价/爱番番的 cookie 值会明文漏进日志、工具输出和 read_file 内容。这里用
+# 「已知敏感 cookie 名」精确匹配补上。值以分号/空白/`&` 为界（cookie 串与
+# form 体的分隔符），base64 的 `=` 与 urlencode 的 `%` 都保留在值内。匹配名
+# 足够特异，误报风险极低。（本地补丁 1731f19e35，2026-09-05 更新重打）
+_SENSITIVE_COOKIE_NAMES = (
+    r"BDUSS",                 # 百度登录态（等价账号密码，最高敏感）
+    r"STOKEN",                # 百度安全 token
+    r"PTOKEN",                # 百度 passport token
+    r"__cas__st__\d+",        # 百度 CAS session ticket（fengchao/爱番番）
+    r"__cas__id__\d+",        # 百度 CAS id
+    r"__cas__rn__",           # 百度 CAS random number
+    r"CPTK_\d+",              # 百度 passport ticket
+    r"CPID_\d+",              # 百度 passport id
+)
+_COOKIE_ASSIGN_RE = re.compile(
+    rf"(?<![A-Za-z0-9_])({'|'.join(_SENSITIVE_COOKIE_NAMES)})\s*=\s*([^;\s&]+)"
+)
+# 线性 pre-gate：文本不含任何 cookie 名关键词时跳过 _COOKIE_ASSIGN_RE，
+# 避免对普通日志/代码做无谓的正则扫描。
+_COOKIE_PRE_GATE_RE = re.compile(
+    r"__cas__|CPTK_|CPID_|BDUSS|STOKEN|PTOKEN"
+)
+
+# ── 有规律的 PII（可正则精确匹配，避免误伤）────────────────────────
+# 国内手机号：11 位，1 开头第二位 3-9。前后非数字边界保证不匹配
+# 更长数字串（订单号/时间戳/UID）中的 11 位片段。
+_CN_MOBILE_RE = re.compile(r"(?<!\d)(1[3-9]\d{9})(?!\d)")
+
+# 18 位身份证号：6 地址码 + 8 生日(18/19/20xx) + 3 顺序码 + 1 校验位。
+# 正则只做结构初筛，GB 11643-1999 加权校验在 _mask_cn_idcard 回调里做，
+# 校验不过则放行——数学验证，不会把 18 位订单号/百度 UID 误当身份证。
+_CN_IDCARD_RE = re.compile(
+    r"(?<!\d)([1-9]\d{5}(?:18|19|20)\d{2}"
+    r"(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx])(?!\d)"
+)
+
+# 邮箱：l…l@domain.tld。格式唯一，误伤风险极低。负向断言排除 URL
+# 分隔符（/ : = ? & #），避免把 URL userinfo（g…t@github.com）、query/path
+# 里的 email（?q=user@example.com）误当成独立邮箱——那些是 URL 语义，
+# 由 URL 专用规则处理。
+_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+\-/:=?&#])([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})(?![A-Za-z0-9.-])"
+)
+
+# 银行卡号：16-19 位数字，且必须落在已知发卡组织的 BIN 号段内 + 通过
+# Luhn 校验。百度 UID 固定 81 开头，不在任何发卡号段，所以 BIN 白名单能
+# 把它挡在银行卡规则外——纯「16-19位+Luhn」会把 12.3% 的 UID 误伤成卡号。
+_BANKCARD_RE = re.compile(r"(?<!\d)(\d{16,19})(?!\d)")
+# 已知发卡组织 BIN 前缀（前 6 位，国际标准 + 中国银联）。银行卡必须落在
+# 这些号段内，否则（如百度 UID 81xxxx）不是银行卡。
+_BANKCARD_BIN_RE = re.compile(
+    r"^(?:"
+    r"4\d{5}"                              # Visa: 4xxxxx
+    r"|5[1-5]\d{4}"                        # MasterCard: 51-55
+    r"|3[47]\d{4}"                         # Amex: 34/37
+    r"|6(?:011|5\d{2}|4[4-9]\d)\d{0,2}"   # Discover: 6011 / 65 / 644-649
+    r"|62\d{4}"                            # 中国银联: 62
+    r"|35[2-8]\d{3}"                       # JCB: 3528-3589
+    r")"
+)
+# 注：MasterCard 2-series（2221-2720）被刻意排除——Discord mention
+# `<@222589316709220353>` 这类 2 开头的 18 位 ID 会命中该号段且 Luhn
+# 通过，导致误伤。2-series 是中国市场极少见的北美新号段，舍弃不心疼。
+
+
+def _is_valid_cn_idcard(id_str: str) -> bool:
+    """GB 11643-1999 身份证校验：17 位加权和 mod 11 映射校验码。"""
+    weights = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+    check_codes = "10X98765432"
+    total = sum(int(id_str[i]) * weights[i] for i in range(17))
+    return check_codes[total % 11] == id_str[17].upper()
+
+
+def _is_luhn_valid(num_str: str) -> bool:
+    """Luhn 校验：银行卡号有效性检查（从右往左双倍求和 mod 10）。"""
+    total = 0
+    for i, ch in enumerate(reversed(num_str)):
+        d = int(ch)
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _mask_cn_mobile(m: re.Match) -> str:
+    """国内手机号脱敏：保留前 3 后 4（138····5678）。"""
+    p = m.group(1)
+    return p[:3] + "····" + p[-4:]
+
+
+def _mask_cn_idcard(m: re.Match) -> str:
+    """身份证脱敏：GB 校验通过则保留前 6 后 4，不通过放行。"""
+    idv = m.group(1)
+    if not _is_valid_cn_idcard(idv):
+        return m.group(0)
+    return idv[:6] + "········" + idv[-4:]
+
+
+def _mask_email(m: re.Match) -> str:
+    """邮箱脱敏：保留本地部分首尾字符（z…n@qq.com）。"""
+    local, _, domain = m.group(1).partition("@")
+    if len(local) >= 2:
+        return f"{local[0]}…{local[-1]}@{domain}"
+    return f"{local}@{domain}"
+
+
+def _mask_bankcard(m: re.Match) -> str:
+    """银行卡脱敏：BIN 白名单 + Luhn 都通过则保留前 4 后 4，否则放行。"""
+    card = m.group(1)
+    if not (_BANKCARD_BIN_RE.match(card[:6]) and _is_luhn_valid(card)):
+        return m.group(0)
+    return card[:4] + "·" * (len(card) - 8) + card[-4:]
+
+
+# 百度账号 UID：18 位、81 开头（818882... 是百度竞价/爱番番账号标识）。
+# 81 不在任何发卡 BIN 号段，也不可能是身份证地区码（11-65 开头），所以
+# 用 81 前缀做精确识别不会与银行卡/身份证规则冲突。
+_BAIDU_UID_RE = re.compile(r"(?<!\d)(81\d{16})(?!\d)")
+
+
+def _mask_baidu_uid(m: re.Match) -> str:
+    """百度 UID 脱敏：保留前 2 后 2（81····87）。"""
+    uid = m.group(1)
+    return uid[:2] + "····" + uid[-2:]
+
 # CDP-URL path: web URLs with a query string / with ``user:password@`` userinfo
 # (DB protocols are covered by _DB_CONNSTR_RE).
 _URL_WITH_QUERY_RE = re.compile(r"(https?|wss?|ftp)://([^\s/?#]+)([^\s?#]*)\?([^\s#]+)(#\S*)?")
@@ -552,7 +682,7 @@ def _redact_url_credentials(text: str, code_file: bool) -> str:
 def _redact_phone(m):
     phone = m.group(1)
     keep = 2 if len(phone) <= 8 else 4
-    return phone[:keep] + "****" + phone[-keep:]
+    return phone[:keep] + "····" + phone[-keep:]
 
 
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
@@ -597,6 +727,17 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _mask_control_split_tokens(text, _prefix_sub)
         text = _PREFIX_RE.sub(lambda m: _prefix_sub(m.group(1)), text)
 
+    # 百度系登录态 cookie（__cas__st__3=…、CPTK...—值不带 vendor 前缀、key
+    # 不含 secret 关键词，前缀/ENV/CFG 三路都不命中，历史明文漏出。精确匹配
+    # 已知 cookie 名；file_read 时用不可复用 sentinel（与前缀一致，见 issue
+    # #35519，避免 agent 把截断值写回损坏凭据）。
+    if _COOKIE_PRE_GATE_RE.search(text):
+        _cookie_sub = _mask_token_nonreusable if file_read else _mask_token
+        text = _COOKIE_ASSIGN_RE.sub(
+            lambda m: f"{m.group(1)}={_cookie_sub(m.group(2))}",
+            text,
+        )
+
     if not code_file:
         text = _redact_assignments(text)
 
@@ -638,6 +779,23 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
 
     if "+" in text:
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
+
+    # 有规律的 PII：手机号 / 身份证 / 邮箱 / 银行卡。
+    # 这些是数据不是凭据——file_read 时同样用头尾保留的脱敏（PII 不像
+    # token 会被写回，无需不可复用 sentinel；保留尾号足以支撑去重/比对）。
+    if _CN_MOBILE_RE.search(text):
+        text = _CN_MOBILE_RE.sub(_mask_cn_mobile, text)
+    if "@" in text:
+        text = _EMAIL_RE.sub(_mask_email, text)
+    if _CN_IDCARD_RE.search(text):
+        text = _CN_IDCARD_RE.sub(_mask_cn_idcard, text)
+    # 百度 UID 必须在银行卡规则之前：UID 是 81 开头的 18 位数字，会被
+    # _BANKCARD_RE 的 16-19 位捕获，虽然 BIN 白名单会放行，但先遮 UID
+    # 语义更清晰、不依赖白名单的顺序兜底。
+    if _BAIDU_UID_RE.search(text):
+        text = _BAIDU_UID_RE.sub(_mask_baidu_uid, text)
+    if _BANKCARD_RE.search(text):
+        text = _BANKCARD_RE.sub(_mask_bankcard, text)
 
     return text
 

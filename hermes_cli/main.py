@@ -3306,6 +3306,13 @@ def _default_to_chat(args) -> None:
 
 def main():
     """Main entry point for hermes CLI."""
+    # Set the active platform early so downstream code that reads
+    # HERMES_PLATFORM (skill filtering, platform_disabled lookup, etc.)
+    # sees 'cli' when the agent is invoked from the terminal.
+    # setdefault() ensures a gateway-imported main() that already set
+    # the variable is never overwritten. (local patch f8f5dc1283,
+    # re-applied on the 2026-09-05 upstream main.)
+    os.environ.setdefault("HERMES_PLATFORM", "cli")
     _set_process_title()
     _advertise_agent_env()
 

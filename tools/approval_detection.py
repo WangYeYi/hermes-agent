@@ -453,10 +453,20 @@ def _home_prefix_fold_regex(path: str):
     """Compile a regex matching *path* as an absolute directory prefix.
     Components match with either separator so native Windows, forward-slash, and mixed forms all
     fold; the caller normalizes the tail's backslashes to ``/``. A non-empty tail is required, so a
-    bare home is never folded. Returns ``None`` for an unset/degenerate path (fewer than two
-    components: ``/``, ``C:\\``, ``""``) so a stray HOME cannot rewrite unrelated prefixes."""
+    bare home is never folded. Returns ``None`` only for a degenerate root
+    (empty path or a bare Windows drive root ``C:\\``) so a stray HOME cannot
+    rewrite unrelated prefixes; a single non-drive segment (``/root``) is a
+    valid POSIX home and folds (issue #84639)."""
     components = [c for c in re.split(r"[/\\]+", path) if c] if path else []
-    if len(components) < 2:
+    # Reject a degenerate root only: no components (``/``) or a bare Windows
+    # drive root (``C:\\``). A single non-drive segment is a valid
+    # single-segment POSIX home (``/root`` when Hermes runs as root) and MUST
+    # fold, so absolute-path writes to ``/root/.ssh/authorized_keys`` hit the
+    # same ~/.ssh-anchored patterns as tilde/$HOME forms (issue #84639; local
+    # patch 278094ad80 re-applied on the Sep-2026 decomposed module).
+    if not components:
+        return None
+    if len(components) == 1 and re.match(r"^[A-Za-z]:$", components[0]):
         return None
     # Optional leading root separator; a Windows drive letter is a component.
     return re.compile(r"[/\\]*" + r"[/\\]+".join(re.escape(c) for c in components) + _PATH_TAIL)
