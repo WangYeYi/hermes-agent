@@ -37,6 +37,14 @@ from tools.approval_floors import (
 from tools.approval_gateway_wait import _await_gateway_decision
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
 from tools.approval_smart import _smart_verdict
+from tools.exec_code_policy import (
+    _PACKAGE_UNRESOLVABLE,
+    _execute_code_has_capability_leak,
+    _execute_code_has_package_acquisition,
+    _execute_code_has_self_destructive_ops,
+    _execute_code_has_sensitive_write,
+    _execute_code_touches_sensitive_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1075,6 +1083,176 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     arbitrary code headlessly without any approval surface is trusted-by-config (set a gateway/ask surface
     or ``approvals.cron_mode`` to require approval). See #30882.
     """
+    # ── Local execute_code security layers (PR #65592) ─────────────────
+    # Hard-block / owner-gate layers below run BEFORE any env/yolo/off
+    # short-circuit — a sandbox, --yolo or approvals.mode=off must never
+    # trade away process-kill, sensitive-write, or package-acquisition
+    # protection.  Restored on top of the Sep-2026 decomposed upstream
+    # guard (2026-09-05 update re-application).
+    _hard_block_reason = _execute_code_has_self_destructive_ops(code)
+    if _hard_block_reason is not None:
+        return {
+            "approved": False,
+            "message": (
+                f"HARD BLOCKED: {_hard_block_reason}. "
+                "This operation can destroy the agent process or kill arbitrary "
+                "system processes. Statically matched process-killing calls are "
+                "never allowed in execute_code scripts — there is no approval "
+                "path, bypass, or override for a matched call. (Runtime-built "
+                "call names via exec/eval string construction are a separate "
+                "static-analysis limitation handled at the sandbox boundary.) "
+                "Use normal tool calls (terminal, read_file, write_file) instead."
+            ),
+            "pattern_key": "execute_code",
+            "description": (
+                "execute_code self-destructive operation (hard blocked — "
+                "no approval path exists for statically matched calls)"
+            ),
+            "outcome": "hard_blocked",
+            "user_consent": False,
+        }
+
+    # ── Layer 3b: Capability leak (#94647) ────────────────────────────
+    # session kernel 跨 cell 绕过的 cell-1 源头：能力以值的形式被存储/
+    # 传递（return/赋值/容器/参数）而非直接调用——每 cell 单独扫描时
+    # 调用点不可见，cell 2 用不透明名称间接调用即绕过。能力泄漏检测
+    # 在能力「离开当前 cell」之前拦截（存不进去，跨 cell 调用链断开）。
+    # 与 self-destructive 同级：无审批路径、yolo/off 不可覆盖。
+    _leak_reason = _execute_code_has_capability_leak(code)
+    if _leak_reason is not None:
+        return {
+            "approved": False,
+            "message": (
+                f"HARD BLOCKED: {_leak_reason}. "
+                "Storing or passing a process-killing capability as a value "
+                "lets it escape per-cell static scanning and be invoked "
+                "indirectly in a later cell (#94647). There is no approval "
+                "path, bypass, or override for a statically matched leak. "
+                "Call the function directly in the same cell, or use normal "
+                "tool calls (terminal, read_file, write_file) instead."
+            ),
+            "pattern_key": "execute_code",
+            "description": (
+                "execute_code capability leak (hard blocked — cross-cell "
+                "capability persistence vector #94647)"
+            ),
+            "outcome": "hard_blocked",
+            "user_consent": False,
+        }
+
+    # ── Layer 4: Sensitive-write destination invariant (#49578) ──────
+    # The file-tool path hard-refuses security-sensitive destinations
+    # (Hermes config, ~/.ssh, system dirs) regardless of approval mode.
+    # execute_code must preserve that effect/destination invariant, so a
+    # statically resolvable write to a protected target is hard-blocked
+    # HERE — before --yolo / approvals.mode=off can trade it away
+    # (2026-08-25 re-review Blocker 1).
+    _sensitive_target = _execute_code_has_sensitive_write(code)
+    if _sensitive_target is not None:
+        return {
+            "approved": False,
+            "message": (
+                f"HARD BLOCKED: execute_code writes to protected path "
+                f"{_sensitive_target!r}. "
+                "This destination is security-sensitive (Hermes config, "
+                "~/.ssh, or system path) and is hard-refused by the file-tool "
+                "path regardless of approval mode (#49578). There is no "
+                "approval path, bypass, or override for a statically matched "
+                "sensitive write — not even under --yolo or approvals.mode=off. "
+                "Edit the file directly instead."
+            ),
+            "pattern_key": "execute_code",
+            "description": (
+                "execute_code write to protected sensitive path (hard blocked — "
+                "destination invariant #49578)"
+            ),
+            "outcome": "hard_blocked",
+            "user_consent": False,
+        }
+
+    # ── Layer 4b: Library-writer sensitive-path invariant (#49578 残余面) ──
+    # pandas/numpy 等库写方法（to_csv/save/dump/...）的路径参数绕过
+    # open()/Path() AST 形状（2026-08-26 复现：
+    # pd.DataFrame(...).to_csv('/root/.ssh/authorized_keys') 曾直接放行）。
+    # 任何非只读方法调用携带静态可解析的敏感路径参数 → 同样 hard-block，
+    # 与上面的目标不变量共用同一优先级（yolo/off 不可覆盖）。
+    _library_sensitive_target = _execute_code_touches_sensitive_path(code)
+    if _library_sensitive_target is not None:
+        return {
+            "approved": False,
+            "message": (
+                f"HARD BLOCKED: execute_code library call references protected "
+                f"path {_library_sensitive_target!r}. "
+                "This destination is security-sensitive (Hermes config, "
+                "~/.ssh, or system path) and is hard-refused by the file-tool "
+                "path regardless of approval mode (#49578). There is no "
+                "approval path, bypass, or override for a statically matched "
+                "sensitive reference — not even under --yolo or "
+                "approvals.mode=off. Use normal tool calls (read_file, "
+                "write_file, terminal) for this path instead."
+            ),
+            "pattern_key": "execute_code",
+            "description": (
+                "execute_code library call on protected sensitive path (hard "
+                "blocked — destination invariant #49578)"
+            ),
+            "outcome": "hard_blocked",
+            "user_consent": False,
+        }
+
+    # ── Layer 4c: Package acquisition invariant (#97657 BLOCKER 2) ────
+    # #97657 (dandckr-ops) introduces the owner-gated package-acquisition
+    # boundary for terminal strings; execute_code can reach the same
+    # package managers via subprocess/os.system process-launch calls
+    # without passing through terminal approval. The same invariant is
+    # enforced HERE — before the isolated-backend / container / --yolo /
+    # approvals.mode=off short-circuits — so package acquisition stays
+    # owner-gated even where ordinary host-oriented guards are skipped
+    # (andrexibiza #97657 review: "the package decision occurring before
+    # the generic container/YOLO/off short-circuits").
+    _pkg = _execute_code_has_package_acquisition(code)
+    if _pkg == _PACKAGE_UNRESOLVABLE:
+        # fail-closed（P0-3）：进程启动调用存在但命令行静态不可解析，
+        # 无法排除包获取 → 要求 owner 精确审批，不放行（含 yolo/off）。
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: execute_code launches a process whose command "
+                "line cannot be statically resolved, so package acquisition "
+                "cannot be ruled out (#97657 owner gate, fail-closed). "
+                "Approve this exact operation explicitly, or run it through "
+                "the terminal tool where the command line is visible."
+            ),
+            "pattern_key": "package acquisition",
+            "description": (
+                "execute_code unresolvable process launch (owner-gated "
+                "fail-closed — cannot rule out package acquisition)"
+            ),
+            "outcome": "package_acquisition",
+            "user_consent": False,
+        }
+    if _pkg is not None:
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: execute_code acquires packages via {_pkg} "
+                f"({_pkg} install/add/run). Package acquisition is a "
+                "supply-chain trust boundary: it requires the owner's exact "
+                "one-operation approval and is never auto-approved — not "
+                "under --yolo, approvals.mode=off, Smart Approval, or in "
+                "isolated backends (#97657). Run it through the terminal "
+                "tool instead (same owner gate applies there), or approve "
+                "this exact operation explicitly."
+            ),
+            "pattern_key": "package acquisition",
+            "description": (
+                "execute_code package acquisition (owner-gated — no yolo/off/"
+                "container bypass, matching #97657 terminal invariant)"
+            ),
+            "outcome": "package_acquisition",
+            "user_consent": False,
+        }
+
     pattern_key = "execute_code"
     description = _EXECUTE_CODE_DESCRIPTION
 
