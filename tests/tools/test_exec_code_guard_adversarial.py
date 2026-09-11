@@ -39,16 +39,17 @@ Run:  PYTHONPATH=<repo> python3 -m pytest tests/tools/test_exec_code_guard_adver
 import pytest
 
 import tools.approval_context as _approval_ctx_mod
+
 from tools.approval import (
     check_execute_code_guard,
 )
 from tools.exec_code_policy import (
-    _classify_exec_code_imports,
     _execute_code_has_capability_leak,
     _execute_code_has_dangerous_ops,
     _execute_code_has_self_destructive_ops,
     _execute_code_has_sensitive_write,
     _execute_code_touches_sensitive_path,
+    _classify_exec_code_imports,
     _log_blocked_exec_code,
 )
 from agent.turn_tool_round import _tool_results_contain_user_blocked
@@ -176,38 +177,62 @@ def test_session_approval_respected(monkeypatch):
     assert result["approved"] is True
 
 
-def test_local_cli_smart_mode_auto_approves_non_sensitive(monkeypatch):
-    """本地 CLI + smart 模式：非敏感 execute_code 走本地 auto-approve 契约。
+def test_cli_smart_approve_verdict(monkeypatch):
+    """smart mode APPROVE → approved with smart_approved flag; no prompt.
 
-    smart 判定仅 gateway/ask 上下文生效（上游 _human_decision 路径，自有
-    test_smart_approval_policy 覆盖）；2026-09-05 上游分解后本地不再触发
-    smart 判定——这里验证 kill/sensitive 之外的内容不被本地 smart 误伤。
+    Upstream's guardian-LLM seam is ``tools.approval._smart_verdict`` (the
+    pre-decomposition ``_smart_approve`` observer pair is gone); the decision
+    itself only runs once the script reaches the gate — i.e. for a CLI context
+    whose static scan found a dangerous op, or a gateway/ask context.
     """
     import tools.approval as approval_module
+
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     monkeypatch.setattr(_approval_ctx_mod, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
     monkeypatch.setattr(approval_module, "_is_single_query_approval_context", lambda: False)
     monkeypatch.setattr(approval_module, "_is_cron_approval_context", lambda: False)
+    monkeypatch.setattr(approval_module, "_smart_verdict", lambda *a, **k: "approve")
     result = check_execute_code_guard(
         'import os\nos.remove("/tmp/x")', env_type="local"
     )
     assert result["approved"] is True
+    assert result.get("smart_approved") is True
 
 
-def test_local_cli_never_smart_denies_non_sensitive(monkeypatch):
-    """本地 CLI 无 smart 判定（上游本地契约）：smart deny 场景在本地不触发
-    _human_decision，普通非敏感内容始终放行。smart DENY 路由本身由上游
-    test_smart_approval_policy 在 gateway/ask 上下文覆盖。
+def test_cli_smart_deny_verdict_goes_to_panel(monkeypatch):
+    """smart mode DENY with the owner present → one-operation override, no persistence.
+
+    The guardian's DENY is not silently downgraded and nothing is allowlisted: the
+    owner still gets the panel (once/deny only) and the denial is final for the turn.
     """
     import tools.approval as approval_module
+    from tools.terminal_tool import set_approval_callback
+
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     monkeypatch.setattr(_approval_ctx_mod, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
     monkeypatch.setattr(approval_module, "_is_single_query_approval_context", lambda: False)
     monkeypatch.setattr(approval_module, "_is_cron_approval_context", lambda: False)
-    result = check_execute_code_guard(
-        'import os\nos.remove("/tmp/x")', env_type="local"
-    )
-    assert result["approved"] is True
+    monkeypatch.setattr(approval_module, "_smart_verdict", lambda *a, **k: "deny")
+    seen = []
+
+    def _cb(command, description, **kwargs):
+        seen.append(kwargs)
+        return "deny"
+
+    set_approval_callback(_cb)
+    try:
+        result = check_execute_code_guard(
+            'import os\nos.remove("/tmp/x")', env_type="local"
+        )
+    finally:
+        set_approval_callback(None)
+
+    assert seen, "owner never saw the one-operation override panel"
+    assert all(kw.get("allow_permanent") is False for kw in seen), seen
+    assert result["approved"] is False
+    assert result["outcome"] == "denied"
 
 
 def test_single_query_deny_mode(monkeypatch):
