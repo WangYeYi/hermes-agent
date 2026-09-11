@@ -39,11 +39,14 @@ from tools.approval_prompt import _present_with_selected_transport, _transport_c
 from tools.approval_smart import _smart_verdict
 from tools.exec_code_policy import (
     _PACKAGE_UNRESOLVABLE,
+    _exec_code_reason_text,
     _execute_code_has_capability_leak,
+    _execute_code_has_dangerous_ops,
     _execute_code_has_package_acquisition,
     _execute_code_has_self_destructive_ops,
     _execute_code_has_sensitive_write,
     _execute_code_touches_sensitive_path,
+    _log_blocked_exec_code,
 )
 
 logger = logging.getLogger(__name__)
@@ -1083,12 +1086,19 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     arbitrary code headlessly without any approval surface is trusted-by-config (set a gateway/ask surface
     or ``approvals.cron_mode`` to require approval). See #30882.
     """
-    # ── Local execute_code security layers (PR #65592) ─────────────────
-    # Hard-block / owner-gate layers below run BEFORE any env/yolo/off
-    # short-circuit — a sandbox, --yolo or approvals.mode=off must never
-    # trade away process-kill, sensitive-write, or package-acquisition
-    # protection.  Restored on top of the Sep-2026 decomposed upstream
-    # guard (2026-09-05 update re-application).
+    # ── execute_code hard-block / owner-gate layers (PR #65592) ────────
+    # These run BEFORE the isolated-backend / container / --yolo /
+    # approvals.mode=off short-circuits below: a sandbox, --yolo or
+    # approvals.mode=off must never trade away process-kill,
+    # sensitive-write, or package-acquisition protection.  Layers live in
+    # tools/exec_code_policy.py; this is only the orchestration seam.
+    # Check for process-killing operations BEFORE any other gate.
+    # These operations can destroy the Hermes parent process or kill
+    # arbitrary system processes.  They NEVER enter the approval chain —
+    # no user consent, yolo mode, smart approval, or session persistence
+    # can override them.  Design follows Linux seccomp / macOS SIP in
+    # spirit (static layer; runtime-built call names are out of scope —
+    # see _execute_code_has_self_destructive_ops docstring).
     _hard_block_reason = _execute_code_has_self_destructive_ops(code)
     if _hard_block_reason is not None:
         return {
@@ -1211,27 +1221,7 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     # (andrexibiza #97657 review: "the package decision occurring before
     # the generic container/YOLO/off short-circuits").
     _pkg = _execute_code_has_package_acquisition(code)
-    if _pkg == _PACKAGE_UNRESOLVABLE:
-        # fail-closed（P0-3）：进程启动调用存在但命令行静态不可解析，
-        # 无法排除包获取 → 要求 owner 精确审批，不放行（含 yolo/off）。
-        return {
-            "approved": False,
-            "message": (
-                "BLOCKED: execute_code launches a process whose command "
-                "line cannot be statically resolved, so package acquisition "
-                "cannot be ruled out (#97657 owner gate, fail-closed). "
-                "Approve this exact operation explicitly, or run it through "
-                "the terminal tool where the command line is visible."
-            ),
-            "pattern_key": "package acquisition",
-            "description": (
-                "execute_code unresolvable process launch (owner-gated "
-                "fail-closed — cannot rule out package acquisition)"
-            ),
-            "outcome": "package_acquisition",
-            "user_consent": False,
-        }
-    if _pkg is not None:
+    if _pkg is not None and _pkg != _PACKAGE_UNRESOLVABLE:
         return {
             "approved": False,
             "message": (
@@ -1256,6 +1246,22 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
     pattern_key = "execute_code"
     description = _EXECUTE_CODE_DESCRIPTION
 
+    # A process launch whose command line cannot be statically resolved cannot be cleared as
+    # non-acquisition either. It is NOT turned into a hard block: the resolution failure is an
+    # inference, not evidence, and `subprocess.run([sys.executable, "-c", ...])` and friends are
+    # ordinary execute_code usage. Instead the owner gate is applied where an owner can actually
+    # answer — the fact is carried into the prompt below (CLI panel / gateway / ask) so the
+    # decision is informed. Where the local auto-approve contract applies (no approval surface,
+    # or an explicit --yolo / approvals.mode=off), there is no authority to fail closed to, so
+    # the session-level trust stands; that residual is documented in the PR, not silently taken.
+    _pkg_unresolved = _pkg == _PACKAGE_UNRESOLVABLE
+    if _pkg_unresolved:
+        description = (
+            f"{description}\n\n"
+            "进程启动的命令行无法静态解析，无法排除包获取（#97657 owner gate）。"
+            "请确认本次操作不进行包安装。"
+        )
+
     # Isolated backends already sandbox the child. vercel_sandbox has no host-bind concept so it stays always-skipped.
     if env_type == "vercel_sandbox":
         return _approved()
@@ -1279,12 +1285,29 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
         return _approved()
 
     # Only gateway/ask contexts get the one-shot whole-script approval. In an interactive CLI the script's terminal()
-    # calls are guarded per-call (context propagates into the RPC thread, #33057), so a whole-script prompt would fire
-    # on every execute_code call. Ask-mode still takes this path even with INTERACTIVE set (how gateway/smart tests
-    # and messaging ask-mode drive whole-script approval); when that leaks into a CLI with no notify callback, the
-    # engine falls through to the CLI Dangerous Command panel instead of a silent pending_approval.
+    # calls are guarded per-call (context propagates into the RPC thread, #33057), so a whole-script prompt on EVERY
+    # call would be noise. A script the static scanner resolves to a dangerous op is the exception (#65592): the local
+    # auto-approve contract must not swallow it, so it falls through to the Dangerous Command panel. Ask-mode still
+    # takes this path even with INTERACTIVE set (how gateway/smart tests and messaging ask-mode drive whole-script
+    # approval); when that leaks into a CLI with no notify callback, the engine falls through to the CLI Dangerous
+    # Command panel instead of a silent pending_approval.
+    danger_reason = None
     if not is_gateway and not is_ask:
-        return _approved()
+        # Non-interactive local sessions keep the auto-approve contract above: the script's own
+        # terminal() calls are guarded per-call, and there is nobody to answer a panel. An
+        # interactive CLI is the exception — a script the static scanner resolves to a dangerous
+        # op, or one whose process launch cannot be cleared of package acquisition, must reach the
+        # Dangerous Command panel instead of running ungated (#65592, #97657).
+        if not is_cli:
+            return _approved()
+        danger_reason = _execute_code_has_dangerous_ops(code)
+        if danger_reason is None and not _pkg_unresolved:
+            return _approved()
+        if danger_reason is not None:
+            _log_blocked_exec_code(code, f"AST-dangerous-ops-CLI-fallthrough:{danger_reason}")
+            description = f"{description}\n\n检测到危险操作：{_exec_code_reason_text(danger_reason)}"
+        else:
+            _log_blocked_exec_code(code, "package-acquisition-unresolvable-CLI-fallthrough")
 
     session_key = get_current_session_key()
     # Built only past the early-return gates so common paths don't copy a potentially-large script into this string.

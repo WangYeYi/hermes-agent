@@ -19,6 +19,7 @@ star imports, assignment aliases, and pathlib writes).
 import pytest
 
 import tools.approval_context as _approval_ctx_mod
+
 from tools.approval import (
     check_execute_code_guard,
 )
@@ -382,16 +383,39 @@ def test_builtin_alias_benign_passes(code):
     assert _execute_code_has_dangerous_ops(code) is None
 
 
-def test_builtin_open_alias_sensitive_write_not_auto_approved():
-    """op = open 别名写敏感路径必须 hard block，alias 不能绕过（2026-08-26
-    漏洞的敏感面；非敏感写在新架构下由 sandbox kernel 隔离承担——上游本地
-    execute_code auto-approve 契约，2026-09-05 适配）。"""
-    result = check_execute_code_guard(
-        "op = open\nwith op('/root/.hermes/config.yaml', 'w') as f:\n    f.write('x')",
-        env_type="local",
-    )
+def test_builtin_open_alias_cli_reaches_panel(monkeypatch):
+    """op = open 别名写文件在交互式 CLI 必须落到审批弹窗，不能 auto-approve
+    （2026-08-26 漏洞）。
+
+    新架构下本地非交互路径仍是上游的 auto-approve 契约（脚本自身的
+    terminal() 调用有逐次守卫），只有交互式 CLI 例外：静态扫描命中危险操作
+    的脚本走 Dangerous Command panel，用户显式决策。
+    """
+    import tools.approval as approval_module
+    from tools.terminal_tool import set_approval_callback
+
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(approval_module, "_is_single_query_approval_context", lambda: False)
+    monkeypatch.setattr(approval_module, "_is_cron_approval_context", lambda: False)
+    monkeypatch.setattr(_approval_ctx_mod, "_get_approval_mode", lambda: "manual")
+    seen = []
+
+    def _cb(command, description, **kwargs):
+        seen.append(description)
+        return "deny"
+
+    set_approval_callback(_cb)
+    try:
+        result = check_execute_code_guard(
+            "op = open\nwith op('/tmp/t.txt', 'w') as f:\n    f.write('x')",
+            env_type="local",
+        )
+    finally:
+        set_approval_callback(None)
+
+    assert seen, "aliased dangerous write never reached the approval panel"
     assert result["approved"] is False
-    assert result["outcome"] == "hard_blocked"
 
 
 @pytest.mark.parametrize("code", [
@@ -989,6 +1013,75 @@ def test_package_acquisition_benign_passes(code):
 def test_package_acquisition_unresolvable_fails_closed(code):
     from tools.exec_code_policy import _PACKAGE_UNRESOLVABLE
     assert _execute_code_has_package_acquisition(code) == _PACKAGE_UNRESOLVABLE
+
+
+# ── owner-gate scope for the unresolvable launch (2026-09-11 rebase adaptation) ──
+# An unresolvable command line is an *inference*, not evidence: `subprocess.run(
+# [sys.executable, "-c", ...])` is ordinary execute_code usage (upstream kernel
+# test test_subprocess_fd_output_reaches_the_result runs exactly that shape), so
+# it is not turned into an unconditional hard block. The owner gate is applied
+# where an owner can answer — the fact is carried into the CLI panel / gateway
+# prompt — and where the local auto-approve contract applies (no approval
+# surface, --yolo, approvals.mode=off) the session-level trust stands. Identified
+# acquisition above stays unconditional; this residual is documented in the PR.
+UNRESOLVABLE_LAUNCH = (
+    'import subprocess, sys\n'
+    'subprocess.run([sys.executable, "-c", "print(1)"])'
+)
+
+
+def _no_approval_surface(monkeypatch, approval_module, *, cli=False, mode="manual"):
+    if cli:
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    else:
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.setattr(approval_module, "_is_gateway_approval_context", lambda: False)
+    monkeypatch.setattr(approval_module, "_is_single_query_approval_context", lambda: False)
+    monkeypatch.setattr(approval_module, "_is_cron_approval_context", lambda: False)
+    monkeypatch.setattr(_approval_ctx_mod, "_get_approval_mode", lambda: mode)
+
+
+@pytest.mark.parametrize("mode_gate", ["normal", "yolo", "off"])
+def test_unresolvable_launch_without_a_surface_keeps_upstream_contract(monkeypatch, mode_gate):
+    """无审批面的本地会话（含显式 --yolo / mode=off）：沿用上游 auto-approve 契约。
+
+    这里没有可 fail closed 的对象——上游对该上下文本来就是 trusted-by-config，
+    且强制阻断会误伤 `subprocess.run([sys.executable, ...])` 这类正常用法
+    （上游 kernel 用例正是这个形状）。已识别的包获取仍在上面无条件拦截。
+    """
+    import tools.approval as approval_module
+    _no_approval_surface(monkeypatch, approval_module)
+    if mode_gate == "yolo":
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+    elif mode_gate == "off":
+        monkeypatch.setattr(_approval_ctx_mod, "_get_approval_mode", lambda: "off")
+    result = check_execute_code_guard(UNRESOLVABLE_LAUNCH, env_type="local")
+    assert result["approved"] is True
+
+
+def test_unresolvable_launch_cli_reaches_panel(monkeypatch):
+    """交互式 CLI：无法排除包获取 → 必须由 owner 决策，不能 auto-approve。"""
+    import tools.approval as approval_module
+    from tools.terminal_tool import set_approval_callback
+
+    _no_approval_surface(monkeypatch, approval_module, cli=True)
+    seen = []
+
+    def _cb(command, description, **kwargs):
+        seen.append(description)
+        return "deny"
+
+    set_approval_callback(_cb)
+    try:
+        result = check_execute_code_guard(UNRESOLVABLE_LAUNCH, env_type="local")
+    finally:
+        set_approval_callback(None)
+
+    assert seen, "unresolvable process launch never reached the approval panel"
+    assert any("包获取" in d for d in seen), seen
+    assert result["approved"] is False
 
 
 # ─────────────────────────────────────────────────────────────────────

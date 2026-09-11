@@ -408,11 +408,6 @@ class TestPerCellRpcAuthority(unittest.TestCase):
         self.assertEqual(seen[0]["task_id"], "kernel-test")
 
     def test_cross_cell_alias_dispatches_under_the_current_cell(self):
-        # Adversarial cross-cell dataflow: a callable captured in cell 1 and
-        # invoked by an opaque global name in cell 2 still crosses the RPC
-        # boundary — under cell 2's authority, allow-list, and budget — the
-        # operative enforcement a per-script static scan cannot provide once
-        # state persists (composition contract with the execute-code guard).
         from tools.terminal_tool import set_approval_callback
 
         seen = []
