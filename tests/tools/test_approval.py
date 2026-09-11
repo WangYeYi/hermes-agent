@@ -2126,3 +2126,138 @@ class TestCliApprovalTimeoutClassifiedSeparately:
         assert result.get("user_consent") is False
         assert "timed out without user response" in result["message"]
         assert "Silence is not consent" in result["message"]
+
+
+# launchd verbs that stop, unload or deregister a running gateway. `disable`
+# does not stop a live job on its own, but it is what makes an unload survive
+# a reboot, so it belongs to the same family.
+GATEWAY_LIFECYCLE_LAUNCHCTL = (
+    "launchctl kickstart -k gui/501/ai.hermes.gateway",
+    "launchctl unload ~/Library/LaunchAgents/ai.hermes.gateway.plist",
+    "launchctl load ~/Library/LaunchAgents/ai.hermes.gateway.plist",
+    "launchctl stop ai.hermes.gateway",
+    "launchctl restart ai.hermes.gateway",
+    "launchctl bootout gui/501/ai.hermes.gateway",
+    "launchctl remove ai.hermes.gateway",
+    "launchctl disable gui/501/ai.hermes.gateway",
+)
+
+
+class TestLifecycleGuardLaunchctlParity:
+    """The in-gateway hard block must cover every launchd verb the approval
+    layer already treats as gateway lifecycle.
+
+    These two layers are not interchangeable. In ``tools/terminal_tool.py``
+    under ``_HERMES_GATEWAY == "1"``, the ``cron.lifecycle_guard`` block is
+    documented as applying unconditionally ("force=True cannot help here"),
+    while ``detect_dangerous_command`` below it is explicitly skipped when
+    ``force=True``. A verb covered only by the approval layer is therefore
+    reachable from inside the gateway, where SIGTERM propagates to the child
+    before the command completes and the service may never come back (#74973).
+
+    ``bootout`` was missing exactly this way: it is the modern replacement for
+    the ``unload`` the guard already listed. See #80260.
+    """
+
+    def test_hard_block_covers_every_lifecycle_verb(self):
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command
+
+        for cmd in GATEWAY_LIFECYCLE_LAUNCHCTL:
+            assert contains_gateway_lifecycle_command(cmd) is True, cmd
+
+    def test_bypassable_layer_is_never_stricter(self):
+        """One-directional invariant: anything ``detect_dangerous_command``
+        flags as gateway lifecycle, the hard block must also catch.
+
+        Not equality — the hard block is legitimately stricter (it also covers
+        ``load``/``restart``, which the approval layer leaves alone). What must
+        never happen is the reverse: a command stopped only by the layer that
+        ``force=True`` skips, leaving no cover inside the gateway."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command
+
+        for cmd in GATEWAY_LIFECYCLE_LAUNCHCTL:
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            if not dangerous:
+                continue
+            assert contains_gateway_lifecycle_command(cmd) is True, (
+                f"approval layer flags this but the unbypassable hard block "
+                f"does not: {cmd}"
+            )
+
+    def test_unrelated_labels_are_not_blocked(self):
+        """The label anchor must still scope this to the gateway — unrelated
+        services, including other Hermes ones, stay runnable."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command
+
+        for cmd in (
+            "launchctl bootout gui/501/com.example.unrelated",
+            "launchctl remove ai.hermes.update-checker",
+            "launchctl disable gui/501/com.apple.WindowServer",
+            "launchctl print system/com.apple.WindowServer",
+        ):
+            assert contains_gateway_lifecycle_command(cmd) is False, cmd
+
+
+class TestSelfTerminationViaProcessNameSelector:
+    """#74078 Part 1 收尾：kill 家族里「先选出 PID、再交给 kill」的管道载体。
+
+    成对覆盖（与 ~/.hermes/scripts/probe-self-kill-matrix.py 同一矩阵）：漏拦是
+    安全问题，误拦会把正常工作（kill 自己 spawn 的子进程、按名字查自己的进程）
+    在无审批路径上掐死，两者都要 pin 住。
+    """
+
+    CARRIERS = [
+        "pgrep -f hermes | xargs kill",
+        "pgrep -f hermes | xargs kill -9",
+        "pgrep -f hermes | xargs -r kill",
+        "pgrep -f hermes | xargs -n1 kill",
+        "pgrep -f hermes | xargs -I{} kill {}",
+        "pgrep -f hermes | xargs -I% sh -c 'kill %'",
+        "pgrep -f hermes | xargs kill -TERM",
+        "pgrep -f gateway | xargs kill",
+        "ps aux | grep hermes | awk '{print $2}' | xargs kill",
+        "ps aux | grep -i hermes-agent | awk '{print $2}' | xargs -r kill",
+        "pgrep -f hermes | while read p; do kill $p; done",
+    ]
+
+    BENIGN = [
+        # 无进程名选择器：普通 PID 管理，交给 _kill_targets_own_process 判定
+        "cat pids.txt | xargs kill",
+        "kill 12345",
+        "kill -l",
+        # 选择器指向别的进程
+        "pgrep -f node | xargs kill",
+        "ps aux | grep nginx | awk '{print $2}' | xargs kill",
+        "pkill -f node",
+        # 只列不杀（无终止动作）
+        "pgrep -f hermes | head",
+        "pgrep -f hermes | wc -l",
+        "pgrep -f hermes | xargs echo",
+        # kill 只是引号里的数据
+        'grep -o "kill" /root/.hermes/logs/agent.log | head',
+        'echo "pgrep hermes | xargs kill"',
+    ]
+
+    @pytest.mark.parametrize("command", CARRIERS)
+    def test_name_selector_carriers_are_flagged(self, command):
+        dangerous, key, description = detect_dangerous_command(command)
+        assert dangerous is True, command
+        assert "self-termination" in (description or ""), command
+        assert "self-termination" in str(key)
+
+    @pytest.mark.parametrize("command", BENIGN)
+    def test_benign_lookalikes_stay_allowed(self, command):
+        dangerous, key, description = detect_dangerous_command(command)
+        assert dangerous is False, f"{command} -> {key} / {description}"
+
+    def test_direct_name_and_substitution_shapes_keep_their_own_reason(self):
+        """回归：既有形状（直写名字、$(pgrep) 替换）保留原描述，不被新判定改写。"""
+        cases = {
+            "pkill -f hermes": "kill hermes/gateway process (self-termination)",
+            "kill $(pgrep -f hermes)": "kill process via pgrep/pidof expansion (self-termination)",
+            "kill `pgrep -f hermes`": "kill process via backtick pgrep/pidof expansion (self-termination)",
+        }
+        for command, expected in cases.items():
+            dangerous, _, description = detect_dangerous_command(command)
+            assert dangerous is True, command
+            assert description == expected, f"{command} -> {description}"
