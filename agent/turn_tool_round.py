@@ -152,25 +152,24 @@ def run_tool_round(
 
     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
-    # ── User-blocked tool check (#65592) ────────────────────────────
-    # When the user denies a dangerous command via the approval dialog,
-    # the tool result is a BLOCKED string.  Without a dispatch-layer halt
-    # the agent may retry the same intent with a different tool — a
-    # bypass of the user's explicit deny.  Scan the tool messages just
-    # produced and force-stop the turn when a BLOCKED is found so the
-    # user's decision is respected.  Must run before the persistence /
-    # guardrail checks below.
-    _user_blocked_halt = _user_blocked_halt_response(agent, messages)
-    if _user_blocked_halt is not None:
-        _turn_exit_reason, final_response = _user_blocked_halt
-        return _verdict("break")
-
     if getattr(agent, "_incremental_persistence_failed", False):
         # Tool result could not be made canonical: never send the in-memory result to
         # the model or project later events from this turn.
         _turn_exit_reason = "session_persistence_failed"
         final_response = ""
         failed = True
+        return _verdict("break")
+
+    # ── User-blocked tool check (#65592) ────────────────────────────
+    # When the user denies a dangerous command via the approval dialog, the tool
+    # result is a BLOCKED string. Without a dispatch-layer halt the agent may retry
+    # the same intent with a different tool — a bypass of the user's explicit deny.
+    # Scan the tool messages just produced and force-stop the turn when a BLOCKED is
+    # found so the user's decision is respected. Runs after the persistence check:
+    # an unpersisted tool result must end the turn without projecting a reply.
+    _user_blocked_halt = _user_blocked_halt_response(agent, messages)
+    if _user_blocked_halt is not None:
+        _turn_exit_reason, final_response = _user_blocked_halt
         return _verdict("break")
 
     if agent._tool_guardrail_halt_decision is not None:
