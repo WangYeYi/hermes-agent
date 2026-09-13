@@ -205,3 +205,27 @@ def test_merge_base_anchor_is_none_without_a_repo(monkeypatch, tmp_path):
 
     monkeypatch.setattr(banner.subprocess, "run", boom)
     assert banner._merge_base_anchor(None) is None
+
+
+def test_upstream_commits_fall_back_to_the_anchor(git_repo, monkeypatch):
+    """"What's changed" uses the anchor too, so a patched checkout still lists upstream commits."""
+    anchor = "c" * 40
+    payload = {"commits": [{
+        "sha": "d" * 40,
+        "commit": {"message": "upstream fix\n\nbody", "committer": {"date": "2026-09-13T00:00:00Z"},
+                   "author": {"name": "Someone"}},
+    }]}
+    monkeypatch.setattr(banner, "_read_json", lambda path: {"head": SHA_A, "target": SHA_B})
+    monkeypatch.setattr(banner, "_merge_base_anchor", lambda repo_dir: anchor)
+
+    seen = []
+
+    def fake_compare(cur, tgt):
+        seen.append(cur)
+        return None if cur == SHA_A else payload  # the un-pushed HEAD returns nothing
+
+    monkeypatch.setattr(banner, "_github_compare", fake_compare)
+
+    rows = banner.upstream_commits_behind()
+    assert seen == [SHA_A, anchor]
+    assert rows and rows[0]["summary"] == "upstream fix"
