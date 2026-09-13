@@ -288,6 +288,12 @@ def upstream_commits_behind(n: int = 20) -> List[Dict[str, Any]]:
     if not head_rev or not target_rev or head_rev == target_rev:
         return []
     payload = _github_compare(head_rev, target_rev)
+    if payload is None:
+        # Same fallback as the count: an un-pushed HEAD cannot be resolved by the API, so
+        # list the commits from the merge-base anchor instead of returning nothing.
+        anchor = _merge_base_anchor(_resolve_repo_dir())
+        if anchor and anchor != head_rev:
+            payload = _github_compare(anchor, target_rev)
     rows: List[Dict[str, Any]] = []
     for entry in (payload or {}).get("commits", []) if isinstance(payload, dict) else []:
         commit = entry.get("commit") or {}
