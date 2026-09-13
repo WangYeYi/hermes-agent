@@ -259,6 +259,24 @@ def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
     return ahead if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0 else None
 
 
+def _merge_base_anchor(repo_dir: Optional[Path]) -> Optional[str]:
+    """Commit the local commits sit on: ``git merge-base HEAD <upstream ref>``.
+
+    A compare base has to be resolvable by GitHub. A checkout carrying local commits has a
+    HEAD GitHub has never seen — the compare call 404s and the count degrades to NO_COUNT —
+    but the merge base of HEAD and the local upstream ref *is* an upstream commit, so GitHub
+    resolves it. Same single request, exact count, and no ``git fetch``: local objects only.
+    Returns None when no local ref is available (then callers keep the old behaviour).
+    """
+    if repo_dir is None:
+        return None
+    for ref in ("origin/main", "upstream/main", "FETCH_HEAD"):
+        rev = _git_stdout(["merge-base", "HEAD", ref], cwd=repo_dir)
+        if rev and _is_full_sha(rev.strip()):
+            return rev.strip()
+    return None
+
+
 def upstream_commits_behind(n: int = 20) -> List[Dict[str, Any]]:
     """Commits between the last checked HEAD and upstream tip, newest first; [] when unknown.
 
@@ -303,6 +321,13 @@ def _tips_behind(head_rev: Optional[str], target_rev: Optional[str], repo_dir: O
             ["merge-base", "--is-ancestor", target_rev, "HEAD"], cwd=repo_dir)):
         return 0
     counted = _github_compare_behind(head_rev, target_rev)
+    if counted is None:
+        # A local-only HEAD 404s on the API. Retry with a base GitHub can resolve — the
+        # commit the local commits sit on — so a patched checkout still gets a count
+        # instead of degrading to "update available" with no number.
+        anchor = _merge_base_anchor(repo_dir)
+        if anchor and anchor != head_rev:
+            counted = _github_compare_behind(anchor, target_rev)
     return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 
 
