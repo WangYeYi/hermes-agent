@@ -158,3 +158,50 @@ def test_upstream_main_sha_ls_remote_fallback_disables_git_prompts(monkeypatch):
     assert kwargs["stdin"] is banner.subprocess.DEVNULL
     assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
     assert kwargs["env"]["GCM_INTERACTIVE"] == "Never"
+
+
+def test_unpushed_head_retries_with_the_merge_base_anchor(git_repo, monkeypatch):
+    """A local-only HEAD 404s on compare; the merge-base anchor recovers the exact count.
+
+    The anchor is an upstream commit, so GitHub can resolve it. Without this retry a
+    checkout carrying local commits degrades to "update available" with no number at all,
+    and ``hermes update`` cannot clear it (patching re-creates the local-only HEAD).
+    """
+    anchor = "c" * 40
+
+    def fake_run(args, **kwargs):
+        sub = args[1]
+        if sub == "rev-parse":
+            return MagicMock(returncode=0, stdout=f"{SHA_A}\n")
+        if sub == "remote":
+            return MagicMock(returncode=0, stdout="https://github.com/NousResearch/hermes-agent.git\n")
+        if sub == "merge-base":
+            if "--is-ancestor" in args:
+                return MagicMock(returncode=1, stdout="")  # the tip is NOT an ancestor of HEAD
+            return MagicMock(returncode=0, stdout=f"{anchor}\n")
+        raise AssertionError(f"passive check must not run git {sub}: {args}")
+
+    monkeypatch.setattr(banner.subprocess, "run", fake_run)
+    monkeypatch.setattr(banner, "_github_branch_tip", MagicMock(return_value=SHA_B))
+
+    seen = []
+
+    def fake_compare(cur, tgt):
+        seen.append(cur)
+        return None if cur == SHA_A else 77  # the un-pushed HEAD 404s; the anchor answers
+
+    monkeypatch.setattr(banner, "_github_compare_behind", fake_compare)
+
+    assert banner.check_for_updates() == 77
+    assert seen == [SHA_A, anchor]
+
+
+def test_merge_base_anchor_is_none_without_a_repo(monkeypatch, tmp_path):
+    """No repo (nix/embedded-rev path) keeps the old behaviour: no anchor, no extra git."""
+    assert banner._merge_base_anchor(None) is None
+
+    def boom(*args, **kwargs):
+        raise AssertionError("no git call may happen without a repo dir")
+
+    monkeypatch.setattr(banner.subprocess, "run", boom)
+    assert banner._merge_base_anchor(None) is None
