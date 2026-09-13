@@ -118,6 +118,40 @@ HARDLINE_PATTERNS = [
     (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
     (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
     (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
+    # ── Session-host protection: the agent must not terminate the host carrying it ──────────────
+    # Destroying the terminal / console host / WSL VM that runs this session kills the conversation
+    # and, on WSL, forces a cold start that flushes the WSLInterop binfmt registration — after which
+    # every Windows executable call fails with "Exec format error". This is not hypothetical: an
+    # injected click closed the hosting terminal and the session died mid-turn. There is no recovery
+    # path for the conversation, so this belongs on the unconditional floor rather than in
+    # DANGEROUS_PATTERNS (where --yolo / approvals.mode=off / cron approve-mode can wave it through).
+    # Two independent lookaheads rather than a sequential match: the target name may precede the verb
+    # (`Get-Process <term> | Stop-Process`), and a shell wrapper puts everything in one quoted
+    # argument (`powershell -Command "Stop-Process -Name <term>"`), which a command-position anchor
+    # alone cannot see. Same shape as the launchctl gateway rule. Patterns are lowercase because the
+    # variant loop lowercases the command before matching.
+    (r'(?=[\s\S]*\b(?:taskkill|stop-process|pkill|killall|terminateprocess|pskill|tskill)\b)'
+     r'(?=[\s\S]*\bwindowsterminal(?:\.exe)?\b)',
+     "terminate Windows Terminal hosting this session"),
+    (r'(?=[\s\S]*\b(?:taskkill|stop-process|pkill|killall|terminateprocess|pskill|tskill)\b)'
+     r'(?=[\s\S]*\b(?:conhost|openconsole|wslhost)(?:\.exe)?\b)',
+     "terminate the console host carrying this session"),
+    (_CMDPOS + r'wsl(?:\.exe)?\s+(?:--shutdown\b|--terminate\b|-t\b)',
+     "shut down or terminate the WSL VM hosting this session"),
+    # Scripted close of the session terminal: its window class plus a close primitive. This is the
+    # exact shape that killed the session (locate the terminal's window class, then close it).
+    (r'(?=[\s\S]*\bcascadia_hosting_window_class\b)'
+     r'(?=[\s\S]*\b(?:wm_close|sc_close|wm_syscommand|closemainwindow)\b)',
+     "send a close message to the session terminal window"),
+    # Scripted input injection aimed at the session terminal: same class plus an input-synthesis API.
+    (r'(?=[\s\S]*\bcascadia_hosting_window_class\b)'
+     r'(?=[\s\S]*\b(?:mouse_event|sendinput|setcursorpos|keybd_event|nircmd)\b)',
+     "synthesize input aimed at the session terminal window"),
+    # The window-close guard must be stood down through its own confirmation path, which asks the
+    # user; killing it bypasses that confirmation silently.
+    (r'(?=[\s\S]*\b(?:taskkill|stop-process|pkill|killall|terminateprocess|pskill|tskill)\b)'
+     r'(?=[\s\S]*\bcloseguard(?:\.exe)?\b)',
+     "terminate the window-close guard (use its --stop path so the stop confirmation is required)"),
 ]
 
 # Pre-compiled at module load so the hot-path matcher never pays the cold re.compile fan-out

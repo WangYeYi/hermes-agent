@@ -802,3 +802,95 @@ def test_sudo_stdin_guard_container_bypass(clean_session):
         for cmd in _SUDO_STDIN_BLOCK:
             result = check_all_command_guards(cmd, env)
             assert result["approved"] is True, f"container {env} should bypass sudo guard on {cmd!r}"
+
+
+# ---------------------------------------------------------------------------
+# Session-host protection: the agent must not terminate the host carrying it
+# ---------------------------------------------------------------------------
+# Destroying the terminal / console host / WSL VM that runs a session has no
+# recovery path: the conversation is gone, and on WSL the forced cold start
+# flushes the WSLInterop binfmt registration, after which every Windows
+# executable call fails with "Exec format error". An injected click closed the
+# hosting terminal mid-session, so these shapes belong on the unconditional
+# floor (never bypassable by --yolo / approvals.mode=off / cron approve mode).
+
+_SESSION_HOST_BLOCK = [
+    # Terminal: every verb spelling, including shell-wrapped and piped forms.
+    "taskkill /IM WindowsTerminal.exe /F",
+    "taskkill /F /IM WindowsTerminal.exe",
+    'taskkill /IM "WindowsTerminal.exe" /F',
+    "Stop-Process -Name WindowsTerminal",
+    "Stop-Process -Name WindowsTerminal -Force",
+    'powershell.exe -NoProfile -Command "Stop-Process -Name WindowsTerminal -Force"',
+    "powershell -NoProfile -Command Get-Process WindowsTerminal | Stop-Process",
+    "pkill -f WindowsTerminal",
+    "killall WindowsTerminal",
+    "pskill WindowsTerminal",
+    "TerminateProcess(term_pid)  # WindowsTerminal",
+    # Console hosts that carry the session's stdio.
+    "taskkill /IM conhost.exe /F",
+    "Stop-Process -Name OpenConsole",
+    "taskkill /IM wslhost.exe /F",
+    # The WSL VM itself.
+    "wsl --shutdown",
+    "wsl.exe --shutdown",
+    "wsl --terminate Ubuntu-22.04",
+    "wsl -t Ubuntu-22.04",
+    # Scripted close of the session window (window class + close primitive).
+    "powershell -Command \"$h=[W]::FindWindow('CASCADIA_HOSTING_WINDOW_CLASS',$null); [W]::SendMessage($h, WM_CLOSE, 0, 0)\"",
+    "python3 -c \"h=find('CASCADIA_HOSTING_WINDOW_CLASS'); send(h, SC_CLOSE)\"",
+    "w.CloseMainWindow()  # CASCADIA_HOSTING_WINDOW_CLASS",
+    # Scripted input synthesis aimed at the session window.
+    "python3 close_wt.py  # SetCursorPos + mouse_event on CASCADIA_HOSTING_WINDOW_CLASS",
+    "powershell -Command SendInput  # CASCADIA_HOSTING_WINDOW_CLASS",
+    # The window-close guard must be stood down via --stop, never killed.
+    "Stop-Process -Name CloseGuard",
+    "taskkill /IM CloseGuard.exe /F",
+]
+
+_SESSION_HOST_ALLOW = [
+    # The host's name as DATA: enumeration, logs, retrieval — no termination verb.
+    "tasklist | findstr WindowsTerminal",
+    "ps aux | grep -i windowsterminal",
+    "grep -c WindowsTerminal ~/.hermes/logs/agent.log",
+    "Get-Process WindowsTerminal | Select-Object Id,StartTime",
+    "ls -la /mnt/c/Users/041701/AppData/Local/0aihermes/windows-terminal/config.json",
+    # Killing some other process is not host self-termination (the approval tier still covers it).
+    "taskkill /IM notepad.exe",
+    "Stop-Process -Name notepad",
+    "Stop-Process -Name DecoyTarget -Force",
+    # Inspecting WSL, not tearing the VM down.
+    "wsl -l -v",
+    "wsl --status",
+    "wsl --list --online",
+    # The guard's own confirmed stop path, and its test binary (not the guard itself).
+    "CloseGuard.exe --stop --reason deploy",
+    "Stop-Process -Name CloseGuardTest",
+    # Printing the window class without a close / input primitive.
+    "python3 -c \"print('CASCADIA_HOSTING_WINDOW_CLASS')\"",
+]
+
+
+@pytest.mark.parametrize("command", _SESSION_HOST_BLOCK)
+def test_session_host_termination_is_hardline_blocked(command):
+    is_hl, desc = detect_hardline_command(command)
+    assert is_hl, f"expected hardline to match {command!r}"
+    assert desc
+
+
+@pytest.mark.parametrize("command", _SESSION_HOST_ALLOW)
+def test_session_host_names_as_data_are_not_blocked(command):
+    is_hl, desc = detect_hardline_command(command)
+    assert not is_hl, f"expected hardline NOT to match {command!r} (got: {desc})"
+    assert desc is None
+
+
+@pytest.mark.parametrize("command", _SESSION_HOST_BLOCK)
+def test_session_host_protection_survives_yolo(command, clean_session, monkeypatch):
+    """The floor is below yolo: these shapes must not run even with yolo forced on."""
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+
+    result = check_all_command_guards(command, "local")
+    assert result["approved"] is False, f"yolo must not bypass session-host protection on {command!r}"
+    assert result.get("hardline") is True
+    assert "BLOCKED (hardline)" in result["message"]
