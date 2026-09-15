@@ -38,6 +38,27 @@ _APPROVAL_OUTCOME_KEYS = {
 def _approval_outcome_label(result) -> str:
     key = _APPROVAL_OUTCOME_KEYS.get(result)
     return t(key) if key else str(result)
+# Local patch (2026-09-16): 打字期间的宽限上限（秒）。pause 不能是无限期 —— 若输入事件本身
+# 丢了（TUI 层丢键 / 界面挂住），无限期暂停会把超时兜底一起关掉，那就真的卡死了。所以 pause
+# 只给一个"远大于正常窗口、但仍有上限"的宽限，且倒计时继续可见。
+CLARIFY_PAUSE_GRACE_SECONDS = 600
+
+# Local patch (2026-09-16): 超时后交给模型的文本（sentinel）。上游原文是
+# "Use your best judgement to make the choice and proceed." —— 即让模型替你挑一个选项，
+# 而上游 issue #107068 指出 auto-decide 可能选中带授权语义的 "Recommended" 选项（静默自我授权）。
+# 这里改成**机制化约束**（这段文本必然进入模型上下文，不依赖模型记得某条规范文字）：
+# 不假定用户选了任何选项、一句话说明等待与接下来的动作并邀请纠正、授权/放行/对外动作类决定
+# 留给用户、问题原样保留让用户仍可回答。
+#
+# 2026-10-07 重打（上游把 CLI 回调改成 batch-only 并返回 {"answers", "outcome": "timed_out"} 后）：
+# 常量保留为超时文本的单一出处 —— CLI 侧不再自行拼串，结构化 outcome 由 tools/clarify_tool
+# 组装成工具结果；这里同时供行为检查/测试断言机制化约束片段。
+_CLARIFY_TIMEOUT_REPLY = (
+    "The user did not provide a response within the time limit. "
+    "Do NOT assume they chose any option. In one line, state that you waited and what you will do "
+    "instead, and invite a correction. Decisions that grant authorization, access, or take an "
+    "outward/costly action must be left to the user, not decided here. Keep the question visible so "
+    "the user can still answer it.")
 
 
 def _approval_gate_on(key: str) -> bool:
@@ -614,13 +635,17 @@ class CLIModalMixin:
         self._clarify_deadline = _time.monotonic() + window
 
     def _clarify_pause_deadline(self) -> None:
-        """Entering freetext ("Other") means the user is typing → stop racing them."""
+        """Entering freetext ("Other") means the user is typing → stop racing them.
+
+        Local patch (2026-09-16): 这**不是**无限期暂停。若输入事件本身丢了（TUI 层丢键 / 界面挂住），
+        无限期暂停会把超时兜底一起关掉，那样就真的卡死了。所以只给一个远大于正常窗口、但仍有上限的
+        宽限：``deadline = now + max(window, CLARIFY_PAUSE_GRACE_SECONDS)``，界面上继续显示剩余时间。
+        """
         window = getattr(self, "_clarify_timeout_window", None)
         if not window:
             return
         self._clarify_paused = True
-        if getattr(self, "_clarify_deadline", None) is not None:
-            self._clarify_deadline = None
+        self._clarify_deadline = _time.monotonic() + max(window, CLARIFY_PAUSE_GRACE_SECONDS)
 
     def _clarify_resume_deadline(self) -> None:
         """Leaving freetext → resume with a fresh full window (not the leftover remainder)."""
