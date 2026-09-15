@@ -783,9 +783,14 @@ class CLITuiMixin:
         if self._clarify_state:
             # None deadline = unlimited wait → hide the countdown entirely.
             if self._clarify_deadline is None:
-                # Local patch (2026-09-16): distinguish "paused while typing" from "unlimited",
-                # otherwise the missing timer reads as a bug instead of a state.
-                countdown = '  (paused while typing)' if getattr(self, '_clarify_paused', False) else ''
+                # Local patch (2026-09-16): "no deadline" is only ever the unlimited configuration
+                # (timeout <= 0); typing no longer produces it (it gets a bounded grace instead).
+                countdown = '  (unlimited)' if not getattr(self, '_clarify_paused', False) else '  (typing)'
+            elif getattr(self, '_clarify_paused', False):
+                # Typing pauses the countdown but NOT forever — keep the grace's remainder visible so
+                # "paused" can never be read as "no deadline at all".
+                _left = max(0, int(self._clarify_deadline - time.monotonic()))
+                countdown = f'  (typing · {_left}s left · any key resets)'
             else:
                 countdown = (f'  ({max(0, int(self._clarify_deadline - time.monotonic()))}s'
                              f' · any key resets)')
