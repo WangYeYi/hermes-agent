@@ -169,11 +169,13 @@ def clarify_callback(cli, question, choices, multi_select=False):
     select multiple options with Space, confirming with Enter.
     """
     from cli import CLI_CONFIG
-    from tools.clarify_gateway import resolve_clarify_timeout
+    # Local patch (2026-09-16): CLI-specific timeout key (resolve_cli_clarify_timeout) — only the
+    # CLI has activity-aware refresh, so it can afford a shorter window than the gateway/desktop.
+    from tools.clarify_gateway import resolve_cli_clarify_timeout
 
     # Canonical clarify timeout, shared with the gateway/TUI path. `<= 0`
     # means unlimited (never auto-skip mid-think) → a null deadline.
-    timeout = resolve_clarify_timeout(CLI_CONFIG)
+    timeout = resolve_cli_clarify_timeout(CLI_CONFIG)
     response_queue = queue.Queue()
     is_open_ended = not choices
     effective_multi = multi_select and not is_open_ended

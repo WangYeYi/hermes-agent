@@ -629,13 +629,14 @@ class CLIModalMixin:
         The single-question path below is unchanged. See #18450.
         """
         from cli import CLI_CONFIG, _DIM, _RST, _cprint
-        from tools.clarify_gateway import resolve_clarify_timeout
+        from tools.clarify_gateway import resolve_cli_clarify_timeout
 
         if questions:
             return self._clarify_callback_batch(questions)
 
-        # Canonical clarify timeout, shared with the gateway/TUI path; `<= 0` = unlimited.
-        timeout = resolve_clarify_timeout(CLI_CONFIG)
+        # Local patch (2026-09-16): CLI-specific timeout key — the CLI is the only surface with
+        # activity-aware refresh, so a shorter window is safe here (`<= 0` still = unlimited).
+        timeout = resolve_cli_clarify_timeout(CLI_CONFIG)
         response_queue = queue.Queue()
         is_open_ended = not choices
         effective_multi = multi_select and not is_open_ended
@@ -765,9 +766,10 @@ class CLIModalMixin:
         the deadline expires with partial answers; a cancel string passes through unchanged so the
         tool core resolves the batch empty."""
         from cli import CLI_CONFIG, _DIM, _RST, _cprint
-        from tools.clarify_gateway import resolve_clarify_timeout
+        from tools.clarify_gateway import resolve_cli_clarify_timeout
 
-        timeout = resolve_clarify_timeout(CLI_CONFIG)
+        # Local patch (2026-09-16): CLI-specific timeout key (a shorter window is safe here).
+        timeout = resolve_cli_clarify_timeout(CLI_CONFIG)
         response_queue = queue.Queue()
         state = {
             "questions": list(questions),
