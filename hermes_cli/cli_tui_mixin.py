@@ -759,9 +759,12 @@ class CLITuiMixin:
         if self._clarify_state:
             # None deadline = unlimited wait → hide the countdown entirely.
             if self._clarify_deadline is None:
-                countdown = ''
+                # Local patch (2026-09-16): distinguish "paused while typing" from "unlimited",
+                # otherwise the missing timer reads as a bug instead of a state.
+                countdown = '  (paused while typing)' if getattr(self, '_clarify_paused', False) else ''
             else:
-                countdown = f'  ({max(0, int(self._clarify_deadline - time.monotonic()))}s)'
+                countdown = (f'  ({max(0, int(self._clarify_deadline - time.monotonic()))}s'
+                             f' · any key resets)')
             if self._clarify_freetext:
                 hint = '  type your answer and press Enter'
             elif self._clarify_state.get("questions"):
@@ -992,6 +995,7 @@ class CLITuiMixin:
             if idx == len(choices):
                 # "Other" → freetext
                 self._clarify_freetext = True
+                self._clarify_pause_deadline()  # local patch 2026-09-16: typing ≠ racing a clock
             elif state.get("questions"):
                 # Batch mode: lock the numbered choice for the active question only.
                 self._clarify_batch_lock(state, choices[idx])
@@ -1256,24 +1260,28 @@ class CLITuiMixin:
 
     def _tui_clarify_toggle(self, event):
         if self._clarify_state:
+            self._clarify_reset_deadline()  # local patch 2026-09-16: activity refreshes the window
             indices = self._clarify_state.get("selected_indices", set())
             indices.symmetric_difference_update({self._clarify_state["selected"]})
             event.app.invalidate()
 
     def _tui_clarify_down(self, event):
         if self._clarify_state:
+            self._clarify_reset_deadline()  # local patch 2026-09-16
             max_idx = len(self._clarify_state.get("choices") or [])  # last index is "Other"
             self._clarify_state["selected"] = min(max_idx, self._clarify_state["selected"] + 1)
             event.app.invalidate()
 
     def _tui_clarify_up(self, event):
         if self._clarify_state:
+            self._clarify_reset_deadline()  # local patch 2026-09-16
             self._clarify_state["selected"] = max(0, self._clarify_state["selected"] - 1)
             event.app.invalidate()
 
     def _tui_clarify_batch_step(self, event, delta: int):
         state = self._clarify_state
         if state and state.get("questions"):
+            # (_clarify_batch_set_active hands the incoming question a fresh window — local patch.)
             self._clarify_batch_set_active(state, (state["active"] + delta) % len(state["questions"]))
             event.app.invalidate()
 
@@ -1566,6 +1574,7 @@ class CLITuiMixin:
         if not text:
             return
         state = self._clarify_state
+        self._clarify_resume_deadline()  # local patch 2026-09-16: submitted → clock resumes
         base = getattr(self, '_clarify_multi_base', None)
         if state.get("questions"):
             # Batch mode: lock the typed answer for the active question. Multi-select "Other"

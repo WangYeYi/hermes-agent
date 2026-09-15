@@ -417,7 +417,10 @@ def _cli_config_defaults():
             "persist_prompts": True,  # one-line summary of resolved modal prompts into scrollback
             "skin": "default",
         },
-        "clarify": {"timeout": 120},  # seconds before a clarify prompt auto-proceeds
+        # Local patch (2026-09-16): do NOT materialize the legacy clarify.timeout here. Its mere
+        # presence is the explicit-override signal used by resolve_clarify_timeout(), so a
+        # default value masks the canonical agent.clarify_timeout (upstream #72688 / #96208 /
+        # #97925; the upstream fix PR #87463 is still unmerged as of this patch).
         "code_execution": {"timeout": 300, "max_tool_calls": 50},
         "auxiliary": {"vision": {"provider": "auto", "model": "", "base_url": "", "api_key": ""}},
         # delegation: empty model/provider = inherit parent; api_key falls back to OPENAI_API_KEY
@@ -2889,6 +2892,9 @@ class HermesCLI(CLIProcessNotificationsMixin, CLIAgentSetupMixin, CLICommandsMix
         self._sudo_state = self._modal_input_snapshot = self._approval_state = None
         self._slash_confirm_state = self._model_picker_state = None
         self._clarify_deadline = self._sudo_deadline = self._approval_deadline = self._slash_confirm_deadline = 0
+        # Local patch (2026-09-16): state for the activity-aware clarify countdown.
+        self._clarify_timeout_window = None   # seconds; None = unlimited/unknown
+        self._clarify_paused = False          # True while typing an "Other" answer
         self._approval_lock = threading.Lock()
         try:  # composer placeholder chosen once so it stays stable on screen
             from hermes_cli.tips import get_random_composer_placeholder
