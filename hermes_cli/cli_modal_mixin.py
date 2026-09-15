@@ -579,7 +579,45 @@ class CLIModalMixin:
         self._clarify_freetext = False
         self._clarify_deadline = None
         self._clarify_multi_base = None
+        self._clarify_timeout_window = None       # local patch 2026-09-16 (activity-aware)
+        self._clarify_paused = False              # local patch 2026-09-16 (paused while typing)
         self._paint_now()
+
+    # --- Local patch (2026-09-16): activity-aware clarify countdown -------------------------
+    # Upstream counts down no matter what the user is doing (issue #33567, whose PR #33571 was
+    # closed unmerged), and the CLI's legacy 120s default made that bite within seconds
+    # (#72688 / #96208). Semantics of this patch:
+    #   · any navigation key  → hand back a FULL window (never a partial remainder)
+    #   · typing an "Other"   → pause the countdown entirely; the panel says "paused while typing"
+    #   · batch questions     → every question gets its own fresh window when it becomes active
+    # It deliberately RESUMES rather than terminates: "one keypress then walk away" must not pin
+    # the turn forever.
+    def _clarify_reset_deadline(self) -> None:
+        """User activity → hand back a full window (no-op while unlimited or paused)."""
+        window = getattr(self, "_clarify_timeout_window", None)
+        if not window or getattr(self, "_clarify_paused", False):
+            return
+        if getattr(self, "_clarify_deadline", None) is None:
+            return
+        self._clarify_deadline = _time.monotonic() + window
+
+    def _clarify_pause_deadline(self) -> None:
+        """Entering freetext ("Other") means the user is typing → stop racing them."""
+        window = getattr(self, "_clarify_timeout_window", None)
+        if not window:
+            return
+        self._clarify_paused = True
+        if getattr(self, "_clarify_deadline", None) is not None:
+            self._clarify_deadline = None
+
+    def _clarify_resume_deadline(self) -> None:
+        """Leaving freetext → resume with a fresh full window (not the leftover remainder)."""
+        if not getattr(self, "_clarify_paused", False):
+            return
+        self._clarify_paused = False
+        window = getattr(self, "_clarify_timeout_window", None)
+        if window:
+            self._clarify_deadline = _time.monotonic() + window
 
     def _clarify_callback(self, question, choices, multi_select=False, questions=None):
         """Clarify-tool platform callback (agent thread): show the selection UI (or freetext for
@@ -609,7 +647,11 @@ class CLIModalMixin:
             "selected_indices": set() if effective_multi else None,
             "response_queue": response_queue}
         self._clarify_deadline = None if timeout <= 0 else _time.monotonic() + timeout
+        self._clarify_timeout_window = timeout if timeout > 0 else None   # local patch 2026-09-16
+        self._clarify_paused = False                                      # local patch 2026-09-16
         self._clarify_freetext = is_open_ended  # open-ended → straight to freetext
+        if is_open_ended:                                                 # local patch 2026-09-16
+            self._clarify_pause_deadline()                                # typing ≠ racing a clock
         self._clarify_multi_base = None
         self._ring_bell(prompt=True, context="clarify")
         self._paint_now()
@@ -640,6 +682,15 @@ class CLIModalMixin:
         state["selected_indices"] = set() if entry["multi_select"] else None
         self._clarify_freetext = not entry["choices"]
         self._clarify_multi_base = None
+        # Local patch (2026-09-16): per-question window. Switching questions (Tab, locking an
+        # answer, re-visiting) starts a FRESH window for the question now on screen instead of
+        # sharing one deadline across the whole batch (4 questions sharing 120s = 30s each).
+        _win = getattr(self, "_clarify_timeout_window", None)
+        if _win:
+            self._clarify_paused = False
+            self._clarify_deadline = _time.monotonic() + _win
+        if self._clarify_freetext:                 # local patch 2026-09-16
+            self._clarify_pause_deadline()         # open-ended question → typing, not racing
         meta = (state.get("answer_meta") or {}).get(entry["qid"])
         if meta is None:
             return
@@ -693,6 +744,7 @@ class CLIModalMixin:
                 # Stash the checked real choices so the freetext submit appends the typed answer.
                 self._clarify_multi_base = selected_choices
                 self._clarify_freetext = True
+                self._clarify_pause_deadline()  # local patch 2026-09-16
                 self._clarify_prefill = meta.get("other_text") or ""
                 return
             self._clarify_batch_lock(
@@ -704,6 +756,7 @@ class CLIModalMixin:
             self._clarify_batch_lock(state, choices[selected], meta={"kind": "choice"})
             return
         self._clarify_freetext = True
+        self._clarify_pause_deadline()  # local patch 2026-09-16: typing an Other answer
         self._clarify_prefill = meta.get("other_text") or "" if meta.get("kind") == "other" else ""
 
     def _clarify_callback_batch(self, questions):
@@ -729,8 +782,14 @@ class CLIModalMixin:
             "multi_select": False,
             "selected_indices": None}
         self._clarify_state = state
+        # Local patch (2026-09-16): remember the window BEFORE set_active() so the first question
+        # gets a fresh window of its own (set_active resets the deadline per question).
+        self._clarify_timeout_window = timeout if timeout > 0 else None
+        self._clarify_paused = False
         self._clarify_batch_set_active(state, 0)
         self._clarify_deadline = None if timeout <= 0 else _time.monotonic() + timeout
+        if getattr(self, "_clarify_freetext", False):   # local patch 2026-09-16
+            self._clarify_pause_deadline()              # first question open-ended → pause
         self._ring_bell(prompt=True, context="clarify")
         self._paint_now()
 

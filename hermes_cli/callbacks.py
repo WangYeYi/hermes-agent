@@ -187,6 +187,10 @@ def clarify_callback(cli, question, choices, multi_select=False):
         "response_queue": response_queue,
     }
     cli._clarify_deadline = None if timeout <= 0 else _time.monotonic() + timeout
+    # Local patch (2026-09-16): remember the window (so user activity can refresh the countdown)
+    # and the paused flag (typing an "Other" answer pauses the countdown instead of racing it).
+    cli._clarify_timeout_window = timeout if timeout > 0 else None
+    cli._clarify_paused = False
     cli._clarify_freetext = is_open_ended
 
     if hasattr(cli, "_app") and cli._app:
