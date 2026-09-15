@@ -284,6 +284,29 @@ def get_clarify_timeout() -> int:
         return 3600
 
 
+def resolve_cli_clarify_timeout(config: dict) -> int:
+    """CLI/TUI 专属 clarify 超时（本地补丁 2026-09-16）。
+
+    为什么 CLI 需要单独的键：CLI 有活动感知（按键 / 打字即刷新为完整窗口，见同一补丁），
+    因此给一个**更短**的超时更好 —— 人在时不会被砍，人真的离开才释放。
+    而 gateway / desktop / 消息平台没有活动感知（上游 #33571 的 gateway 那半从未合并），
+    同一个短超时会把正在打字的用户砍掉。resolve_clarify_timeout() 是共享 resolver，
+    无法区分调用方，所以用独立键分开。
+
+    优先级：``clarify.timeout_cli``（本补丁新增，只被 CLI 读取）
+            > ``clarify.timeout``（legacy，用户显式设置）
+            > ``agent.clarify_timeout``（canonical，gateway/desktop 也读它）
+    ``<= 0`` 仍表示不限时（与 canonical 语义一致）。
+    """
+    raw = (config.get("clarify") or {}).get("timeout_cli")
+    if raw is None:
+        return resolve_clarify_timeout(config)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return resolve_clarify_timeout(config)
+
+
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
