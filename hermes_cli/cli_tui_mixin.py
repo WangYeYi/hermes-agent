@@ -1592,9 +1592,46 @@ class CLITuiMixin:
             self._tui_enter_clarify_freetext(event)
             return True
         if self._clarify_state:
+            # Local patch (2026-09-16): 用户没选「其他回答」就直接打字 → 必须当成自由文本答案，
+            # 不能静默丢弃。上游行为：字符进 buffer，回车却走 _tui_enter_clarify_choice 提交高亮项，
+            # 用户以为答的是自己写的内容，系统按别的选项走了（实测已复现，属静默失败）。
+            _typed = (event.app.current_buffer.text or "").strip()
+            if _typed:
+                state = self._clarify_state
+                if state.get("multi_select"):
+                    # 多选：已勾选项作为 base、自由文本追加 —— 与「Other (type below)」同一语义
+                    _idxs = sorted(state.get("selected_indices") or set())
+                    _choices = state.get("choices") or []
+                    self._clarify_multi_base = [_choices[i] for i in _idxs if i < len(_choices)]
+                self._clarify_freetext = True
+                self._tui_enter_clarify_freetext(event)
+                return True
             self._tui_enter_clarify_choice(event)
             return True
         return False
+
+    def _tui_clarify_any_key(self, event) -> None:
+        """Local patch (2026-09-16): 不选「其他回答」就开始打字 = 进入自由输入。
+
+        承载用户要求「不选4但开始输入 → 视为在输入（暂停计时）」：切成 freetext、暂停倒计时
+        （带 grace 上限，不会无限期），并把刚敲下的字符补进缓冲区，打字过程不丢不断。
+        """
+        state = self._clarify_state
+        if not state or getattr(self, "_clarify_freetext", False):
+            return
+        if state.get("multi_select"):
+            _idxs = sorted(state.get("selected_indices") or set())
+            _choices = state.get("choices") or []
+            self._clarify_multi_base = [_choices[i] for i in _idxs if i < len(_choices)]
+        self._clarify_freetext = True
+        self._clarify_pause_deadline()
+        data = getattr(event, "data", "")
+        if data:
+            try:
+                event.app.current_buffer.insert_text(data)
+            except Exception:
+                pass
+        event.app.invalidate()
 
     def _tui_enter_clarify_freetext(self, event) -> None:
         """Clarify "Other": submit the typed answer (empty input is ignored)."""
@@ -2014,6 +2051,12 @@ class CLITuiMixin:
         for _num in range(10):
             _idx = 9 if _num == 0 else _num - 1
             kb.add(str(_num), filter=_clarify_nav)(self._tui_make_clarify_number_handler(_idx))
+        # Local patch (2026-09-16): 不选「其他回答」直接敲字符 → 进入自由输入并暂停计时。
+        # 注册在数字键之后：prompt_toolkit 先匹配更具体的键，所以数字键仍优先选中选项。
+        from prompt_toolkit.keys import Keys as _Keys
+        kb.add(_Keys.Any, filter=Condition(
+            lambda: bool(self._clarify_state) and not self._clarify_freetext
+        ))(self._tui_clarify_any_key)
 
         _approval = Condition(lambda: bool(self._approval_state))
         _slash_confirm = Condition(lambda: bool(self._slash_confirm_state))
