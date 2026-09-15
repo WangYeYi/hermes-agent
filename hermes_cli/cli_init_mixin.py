@@ -378,6 +378,9 @@ class CLIInitMixin:
         self._sudo_state = self._modal_input_snapshot = self._approval_state = None
         self._slash_confirm_state = self._model_picker_state = None
         self._clarify_deadline = self._sudo_deadline = self._approval_deadline = self._slash_confirm_deadline = 0
+        # Local patch (2026-09-16): state for the activity-aware clarify countdown.
+        self._clarify_timeout_window = None   # seconds; None = unlimited/unknown
+        self._clarify_paused = False          # True while typing an "Other" answer
         self._approval_lock = threading.Lock()
         try:  # composer placeholder chosen once so it stays stable on screen
             from hermes_cli.tips import get_random_composer_placeholder
