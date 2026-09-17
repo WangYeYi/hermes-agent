@@ -2826,7 +2826,14 @@ def _build_wsl_interop_paths(path_entries: list[str]) -> list[str]:
     if not is_wsl():
         return []
 
-    candidates = [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry.startswith("/mnt/")]
+    # 本地补丁（原 commit 5d89de589，2026-09-18 重打）：不再从当前进程 PATH 抓取所有 /mnt/ 路径。
+    # 原设计意图是让 systemd service 也能调用 Windows 工具（powershell.exe 等），但无差别抓取会把
+    # Desktop app 目录 / git / node 等大量无关路径写进 unit，使网关每次 PATH 解析都经 Plan 9 命中
+    # Windows 文件系统，累积流量触发 p9io AcceptAsync 断连 → WSL VM 重启（本机 2026-07-28 实测事故）。
+    # 硬编码 Windows 系统路径 + which() 解析已足够覆盖实际需要的互操作工具。
+    # 上游 issue #73163（同一问题）仍 OPEN；上游把抓取逻辑改写为一行列表推导后保留至今，
+    # 调用点已从 2 处减为 1 处（仅 generate_systemd_unit），故本补丁是本地唯一缓解手段。
+    candidates: list[str] = []
     for executable in ("powershell.exe", "cmd.exe", "explorer.exe", "wsl.exe"):
         resolved = shutil.which(executable)
         if resolved:

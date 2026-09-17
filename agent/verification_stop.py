@@ -220,7 +220,12 @@ def build_verify_on_stop_nudge(
         f"Verification status: {_status_detail(status)}\n\n"
         f"Changed paths:\n{_format_changed_paths(paths)}\n\n"
         f"{command_instruction} If verification is not possible, explain the "
-        "concrete blocker instead of claiming the work is fully verified."
+        "concrete blocker instead of claiming the work is fully verified.\n\n"
+        # 本地补丁（原 commit d4b877f6a，2026-09-18 重打）：#62142 —— nudge 只问测试结果时，
+        # 模型会用「tests pass」替换掉原本已给出的答案。这里显式要求复述原答案，让答案活过
+        # 验证回路。文案保持原文，避免改动语义。
+        "[Coding] After verification, restate your original answer in full — "
+        "do not replace it with a verification receipt."
         f"{addendum}]"
     )
 
