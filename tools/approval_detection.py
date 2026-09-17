@@ -130,26 +130,31 @@ HARDLINE_PATTERNS = [
     # argument (`powershell -Command "Stop-Process -Name <term>"`), which a command-position anchor
     # alone cannot see. Same shape as the launchctl gateway rule. Patterns are lowercase because the
     # variant loop lowercases the command before matching.
-    (r'(?=[\s\S]*\b(?:taskkill|stop-process|pkill|killall|terminateprocess|pskill|tskill)\b)'
+    # ⚠ 每条组合规则以 `\A` 开头（2026-09-17 修复性能回归）：两个 lookahead 都是零宽、无位置
+    #    约束的组合，「在任意位置匹配」与「在位置 0 匹配」等价（`[\s\S]*` 吞掉任意前缀），而 `\A`
+    #    让 re.search 只在起点评估一次 —— 不加锚时引擎会在每个起点重扫全文 = O(len²)：16 KB 命令
+    #    实测硬线检测 43.5s（持有 GIL，卡住 gateway 的检测路径）。锚定后 <0.1s，判定不变（20310
+    #    次新旧模式对比 0 不一致）。与上游 launchctl gateway 规则同一手法。
+    (r'\A(?=[\s\S]*\b(?:taskkill|stop-process|pkill|killall|terminateprocess|pskill|tskill)\b)'
      r'(?=[\s\S]*\bwindowsterminal(?:\.exe)?\b)',
      "terminate Windows Terminal hosting this session"),
-    (r'(?=[\s\S]*\b(?:taskkill|stop-process|pkill|killall|terminateprocess|pskill|tskill)\b)'
+    (r'\A(?=[\s\S]*\b(?:taskkill|stop-process|pkill|killall|terminateprocess|pskill|tskill)\b)'
      r'(?=[\s\S]*\b(?:conhost|openconsole|wslhost)(?:\.exe)?\b)',
      "terminate the console host carrying this session"),
     (_CMDPOS + r'wsl(?:\.exe)?\s+(?:--shutdown\b|--terminate\b|-t\b)',
      "shut down or terminate the WSL VM hosting this session"),
     # Scripted close of the session terminal: its window class plus a close primitive. This is the
     # exact shape that killed the session (locate the terminal's window class, then close it).
-    (r'(?=[\s\S]*\bcascadia_hosting_window_class\b)'
+    (r'\A(?=[\s\S]*\bcascadia_hosting_window_class\b)'
      r'(?=[\s\S]*\b(?:wm_close|sc_close|wm_syscommand|closemainwindow)\b)',
      "send a close message to the session terminal window"),
     # Scripted input injection aimed at the session terminal: same class plus an input-synthesis API.
-    (r'(?=[\s\S]*\bcascadia_hosting_window_class\b)'
+    (r'\A(?=[\s\S]*\bcascadia_hosting_window_class\b)'
      r'(?=[\s\S]*\b(?:mouse_event|sendinput|setcursorpos|keybd_event|nircmd)\b)',
      "synthesize input aimed at the session terminal window"),
     # The window-close guard must be stood down through its own confirmation path, which asks the
     # user; killing it bypasses that confirmation silently.
-    (r'(?=[\s\S]*\b(?:taskkill|stop-process|pkill|killall|terminateprocess|pskill|tskill)\b)'
+    (r'\A(?=[\s\S]*\b(?:taskkill|stop-process|pkill|killall|terminateprocess|pskill|tskill)\b)'
      r'(?=[\s\S]*\bcloseguard(?:\.exe)?\b)',
      "terminate the window-close guard (use its --stop path so the stop confirmation is required)"),
 ]
