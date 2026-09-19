@@ -1705,6 +1705,14 @@ class CLITuiMixin:
             self._clarify_state = None
         else:
             self._clarify_freetext = True  # "Other" selected
+        if self._clarify_freetext:
+            # Local patch (2026-09-19): reaching the "Other" row with ↑/↓ + Enter (or checking
+            # it in multi-select) is the same "the user is now typing" signal as the number-key
+            # and any-key entries — pause the countdown here too. Until this fix only those two
+            # entries paused, and _tui_clarify_any_key() returns early once _clarify_freetext is
+            # set, so the keystrokes after picking Other could not pause it either: the panel
+            # kept racing the short CLI window (60s) instead of the 600s typing grace.
+            self._clarify_pause_deadline()
         event.app.invalidate()
 
     def _tui_collapse_paste(self, text: str, line_count: int, *, fallback: bool) -> str:
