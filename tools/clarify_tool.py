@@ -108,6 +108,41 @@ def _result(normalized: List[dict], reply: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+def fire_clarify_hook(phase: str, question: str = "", choice: Optional[str] = None,
+                      surface: str = "cli") -> None:
+    """Local patch (2026-09-19): let a clarify prompt drive the approval observers
+    (``pre_approval_request`` / ``post_approval_response``).
+
+    Observers of those events are the surfaces that key off "the agent was blocked on a human" —
+    e.g. a desktop taskbar flash. Clarify was the one such path with no hook at all, so it stayed
+    invisible. ``phase`` is ``"pre"`` (the prompt is about to be shown) or ``"post"`` (it is over:
+    answered, timed out, cancelled).
+
+    Best-effort by design: the observers cannot veto anything and a missing plugin system must
+    never affect the question itself, so every failure here is swallowed.
+    """
+    try:
+        from tools.approval_context import _fire_approval_hook, get_current_session_key
+    except Exception:
+        return
+    payload = {
+        "command": f"clarify: {(question or '').strip()[:80]}",
+        "description": "clarify",
+        "pattern_key": "clarify",
+        "pattern_keys": ["clarify"],
+        "session_key": get_current_session_key(),
+        "surface": surface,
+    }
+    try:
+        if phase == "post":
+            payload["choice"] = choice or "answered"
+            _fire_approval_hook("post_approval_response", **payload)
+        else:
+            _fire_approval_hook("pre_approval_request", **payload)
+    except Exception:
+        return  # observers are optional; the question is not
+
+
 def clarify_tool(questions, callback: Optional[Callable] = None) -> str:
     """Ask 1-5 questions in one call. ``callback(questions) -> {"answers", "outcome", "notice"?}``
     is platform injected (cli.py / gateway / tui_gateway) and receives the normalized list."""

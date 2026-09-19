@@ -655,6 +655,20 @@ class CLIModalMixin:
         window = getattr(self, "_clarify_timeout_window", None)
         if window:
             self._clarify_deadline = _time.monotonic() + window
+
+    def _clarify_flash(self, phase, question="", choice=None):
+        """Local patch (2026-09-19): hand a clarify prompt to the approval observers
+        (``pre_approval_request`` / ``post_approval_response``) so "the agent is waiting on you"
+        is signalled for clarify the same way it is for a command approval. Best-effort: never
+        raises, and other surfaces gate themselves off (the observer's surface/TTY checks).
+        See ``tools.clarify_tool.fire_clarify_hook``."""
+        try:
+            from tools.clarify_tool import fire_clarify_hook
+
+            fire_clarify_hook(phase, question=question, choice=choice)
+        except Exception:
+            return  # never let the signal path touch the prompt
+
     # --- Connection setup --------------------------------------------------
     def _connection_operation(self, payload):
         from tools.connectors import live
@@ -1025,6 +1039,12 @@ class CLIModalMixin:
         state["answers"][entry["qid"]] = answer
         state.setdefault("answer_meta", {})[entry["qid"]] = meta or {"kind": "choice"}
         self._persist_prompt_summary("?", t("cli.clarify.label"), entry["question"], "" if answer is None else str(answer))
+        # Local patch (2026-09-19): the user has acted on the panel — the first locked answer is
+        # proof they are back at the keyboard, so stop signalling now instead of waiting for the
+        # remaining questions (every lock path funnels through here: choice, multi, freetext).
+        if not state.get("flash_stopped"):
+            state["flash_stopped"] = True
+            self._clarify_flash("post", entry["question"], "answered")
         total = len(state["questions"])
         for offset in range(1, total + 1):
             candidate = (state["active"] + offset) % total
@@ -1103,8 +1123,20 @@ class CLIModalMixin:
             self._clarify_pause_deadline()              # first question open-ended → pause
         self._ring_bell(prompt=True, context=t("cli.clarify.bell_context"))
         self._paint_now()
-
-        result = self._poll_modal_queue(response_queue, "_clarify_deadline")
+        # Local patch (2026-09-19): one pre for the whole panel. The first locked answer stops it
+        # (_clarify_batch_lock) — the user is at the keyboard again, so there is no reason to keep
+        # signalling until every question is answered. This finally is the backstop for the exits
+        # the lock never sees (timeout / cancel / exception) and is a no-op after it already fired.
+        state["flash_stopped"] = False
+        self._clarify_flash("pre", state["questions"][0]["question"] if state["questions"] else "")
+        result = None
+        try:
+            result = self._poll_modal_queue(response_queue, "_clarify_deadline")
+        finally:
+            if not state.get("flash_stopped"):
+                state["flash_stopped"] = True
+                self._clarify_flash("post", "",
+                                    "timeout" if result is None or result is _TIMED_OUT else "answered")
         if result is not _TIMED_OUT:
             self._clarify_deadline = None
             outcome = "cancelled" if result is None else "submitted"
