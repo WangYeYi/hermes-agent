@@ -16,7 +16,8 @@ from hermes_constants import get_hermes_home
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
-    EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS, is_skill_support_path as _is_skill_support_path)
+    EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS, is_skill_support_path as _is_skill_support_path,
+    read_skill_head as _read_skill_head)
 from tools.skills_tool_setup import (  # noqa: F401
     SkillReadinessStatus, _build_setup_note, _capture_required_environment_variables,
     _get_required_environment_variables, _is_env_var_persisted, _is_remote_env_backend)
@@ -208,7 +209,7 @@ def _skill_catalog(*, skip_disabled: bool = False, include_hidden: bool = False)
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
             try:
-                frontmatter, body = _parse_frontmatter(_read_skill_text(skill_md)[:4000])
+                frontmatter, body = _parse_frontmatter(_read_skill_head(skill_md))
                 description = frontmatter.get("description", "")
                 if not description:  # first non-heading body line (a null value stays null)
                     description = next((ln for ln in map(str.strip, body.strip().split("\n"))
