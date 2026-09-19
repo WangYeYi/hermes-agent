@@ -32,6 +32,7 @@ DEFAULT_STALE_AFTER_DAYS, DEFAULT_ARCHIVE_AFTER_DAYS = 14, 30
 # The LLM consolidation fork is opt-in; the deterministic inactivity prune
 # (apply_automatic_transitions) always runs when the curator is enabled.
 DEFAULT_CONSOLIDATE = False
+DEFAULT_NEVER_ARCHIVE: tuple = ()  # local patch: curator.never_archive default (empty = unchanged behaviour)
 
 
 # --- .curator_state — persistent scheduler + status ---
@@ -127,6 +128,20 @@ def get_consolidate() -> bool:
     return bool(_load_config().get("consolidate", DEFAULT_CONSOLIDATE))
 
 
+def get_never_archive() -> frozenset:
+    """Skill names exempt from automatic transitions (``curator.never_archive``).
+
+    Local patch. Complements ``pinned``: pin is per-skill state in ``.usage.json`` and the CLI
+    refuses it for bundled/hub-installed skills, while this list is config-side and therefore
+    covers exactly those cases (a bundled built-in can be pruned via ``prune_builtins`` yet can
+    never be pinned). Accepts a list or a single string; blanks are ignored.
+    """
+    raw = _load_config().get("never_archive", DEFAULT_NEVER_ARCHIVE)
+    if isinstance(raw, str):
+        raw = [raw]
+    return frozenset(str(n).strip() for n in (raw or ()) if str(n).strip())
+
+
 # --- Idle / interval check ---
 
 def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
@@ -186,8 +201,8 @@ def _archive_as_curator(_u, name: str) -> bool:
 
 
 def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int]:
-    """Move every curator-managed skill between active/stale/archived based on its latest real activity; pinned skills are
-    never touched. Built-ins are seeded with a baseline record on first sight so their inactivity clock starts NOW, not at epoch.
+    """Move every curator-managed skill between active/stale/archived based on its latest real activity; pinned skills,
+    cron-referenced skills, and names listed in ``curator.never_archive`` are never touched. Built-ins are seeded with a baseline record on first sight so their inactivity clock starts NOW, not at epoch.
     Returns a counter dict."""
     from tools import skill_usage as _u
 
@@ -203,10 +218,11 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
         _u.set_state(name, state)
         counts[key] += 1
 
+    never_archive = get_never_archive()  # local patch: config-side exemption list
     for row in _u.curated_report():
         counts["checked"] += 1
         name = row["name"]
-        if row.get("pinned") or name in protected:
+        if row.get("pinned") or name in protected or name in never_archive:
             continue
         # First sight with no persisted record: anchor its clock to now and defer.
         if not row.get("_persisted", True):

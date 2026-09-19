@@ -1431,6 +1431,10 @@ DEFAULT_CONFIG = {
         "prune_builtins": False,
         # TTL purge of skills/.archive/: 0 = never; > 0 lets the explicit `hermes curator purge`
         # delete older archived skills (never automatic; logged in the ledger).
+        # Local patch: skill names the deterministic pass must never touch (no stale, no archive).
+        # Complements `pin`: pin is per-skill state in .usage.json and is refused for bundled /
+        # hub-installed skills, while this list is config-side and covers exactly those cases.
+        "never_archive": [],
         "archive_ttl_days": 0,
         # Before a consolidation pass (the only one that rewrites skill content in place), snapshot
         # ~/.hermes/skills/ to ~/.hermes/skills/.curator_backups/<utc-iso>/skills.tar.gz (`hermes curator
