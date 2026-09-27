@@ -464,3 +464,44 @@ def test_branch_tip_failure_names_the_cause(installation):
     status = check_for_updates(install_root=root, home=home, force=True)
     assert status["error"] == "fetch-failed"
     assert "HTTP 503" in status["message"]
+
+
+def test_behind_count_falls_back_to_merge_base_anchor(monkeypatch):
+    """本地补丁：未推送 HEAD 在 compare 上不可解析时，用 merge-base anchor 重试一次。
+
+    上游实现只用 ``co.head`` 作 compare base：本地带未推送 commit（补丁树）时 GitHub 404，
+    ``behind`` 退化成 ``UPDATE_AVAILABLE_NO_COUNT`` —— banner 只剩 "update available" 没有
+    数字，whats-changed 列表也是空的。本地补丁在 compare 失败后用
+    ``git merge-base HEAD <upstream ref>``（一个 GitHub 认得的**上游** commit）重试，
+    仍然是单次 API 请求、不跑 ``git fetch``。
+    """
+    from pathlib import Path
+
+    from hermes_cli import source_check
+    from hermes_cli.source_check import _Checkout
+
+    head, target, anchor = "a" * 40, "b" * 40, "d" * 40
+    co = _Checkout(root=Path("."), git="git", embedded=None, head=head, current_branch="main",
+                   origin="origin", repository="NousResearch/hermes-agent", dirty=False)
+
+    seen: list = []
+    monkeypatch.setattr(source_check, "_git_ok", lambda *a, **k: False)
+    monkeypatch.setattr(source_check, "_git_stdout", lambda *a, **k: anchor)
+    monkeypatch.setattr(source_check, "_github_compare",
+                        lambda cur, tgt, repository=source_check.OFFICIAL_REPOSITORY:
+                        seen.append(cur) or (None if cur == head else {"ahead_by": 3, "commits": []}))
+
+    behind, _commits = source_check._behind_count(co, target)
+    assert behind == 3, "未推送 HEAD 应回退到 merge-base anchor 拿到精确计数"
+    assert seen == [head, anchor], "先试 HEAD、再试 anchor，恰好两次 compare 请求"
+
+    # 反向：anchor 也解析不了 → 维持 NO_COUNT（宁愿没数字，也不编一个）
+    seen.clear()
+    monkeypatch.setattr(source_check, "_github_compare", lambda *a, **k: seen.append(1) and None)
+    assert source_check._behind_count(co, target)[0] == source_check.UPDATE_AVAILABLE_NO_COUNT
+
+    # 反向：没有本地 upstream ref（anchor=None）→ 不额外发请求，行为与上游一致
+    seen.clear()
+    monkeypatch.setattr(source_check, "_git_stdout", lambda *a, **k: "")
+    assert source_check._behind_count(co, target)[0] == source_check.UPDATE_AVAILABLE_NO_COUNT
+    assert len(seen) == 1, "anchor 不存在时只应有一次 compare 请求"

@@ -306,6 +306,25 @@ def _heal_deleted_branch(branch_config_path: Path, desktop_config: dict) -> None
         atomic_json_write(branch_config_path, {**desktop_config, "branch": "main"})
 
 
+def _merge_base_anchor(co: _Checkout) -> Optional[str]:
+    """Commit the local commits sit on: ``git merge-base HEAD <upstream ref>``.
+
+    Local patch (carried over from the old ``hermes_cli/banner.py`` implementation when upstream
+    moved passive checks into this module). A compare *base* has to be resolvable by GitHub: a
+    checkout carrying unpushed local commits has a HEAD GitHub has never seen, so the compare
+    call 404s and the count degrades to ``NO_COUNT``. The merge base of HEAD and the local
+    upstream ref *is* an upstream commit, so GitHub resolves it — same single request, exact
+    count, and no ``git fetch`` (local objects only). Returns None when no local ref exists.
+    """
+    if co.embedded:
+        return None
+    for ref in ("origin/main", "upstream/main", "FETCH_HEAD"):
+        rev = _git_stdout(["merge-base", "HEAD", ref], cwd=co.root, git=co.git)
+        if rev and _is_full_sha(rev.strip()):
+            return rev.strip()
+    return None
+
+
 def _behind_count(co: _Checkout, target: str) -> tuple[int, list[dict]]:
     """``(behind, commits)`` for ``target``: local ancestry first, then the GitHub compare API."""
     if co.head == target or (not co.embedded and _git_ok(
@@ -316,6 +335,15 @@ def _behind_count(co: _Checkout, target: str) -> tuple[int, list[dict]]:
         ahead = (payload or {}).get("ahead_by")
         if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0:
             return ahead, (_quiet(lambda: _commits(payload), []) if ahead else [])
+        # Local patch: an unpushed HEAD 404s on the API. Retry with a base GitHub can resolve —
+        # the commit the local commits sit on — so a patched checkout still gets an exact count
+        # and its "what changed" list instead of degrading to NO_COUNT.
+        anchor = _merge_base_anchor(co)
+        if anchor and anchor != co.head:
+            payload = _github_compare(anchor, target, co.repository)
+            ahead = (payload or {}).get("ahead_by")
+            if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0:
+                return ahead, (_quiet(lambda: _commits(payload), []) if ahead else [])
     return UPDATE_AVAILABLE_NO_COUNT, []
 
 
