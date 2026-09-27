@@ -473,6 +473,14 @@ def _apply_output_hooks(
             conversation_history=list(messages),
             model=agent.model,
             platform=platform,
+            # 2026-09-27（本地补丁）：把 agent 已有的状态输出口子开放给插件。
+            # 动机：插件唯一能碰到的通道是 transform_llm_output（改写回答文本），于是状态行
+            # 混进回答；而 _emit_status 早就存在且两侧都覆盖（CLI: status_output.py 的
+            # _vprint(force=True) 打印在回答框外；gateway: status_callback → 前端 system 消息），
+            # 只是没对插件开放。这里开放它，不是新增通道。
+            # 安全性：shell hook 的 payload 用 json.dumps(default=str) 序列化 → callable 变字符串，
+            # 不会崩；_invoke_hook_safely 吞异常。插件侧对 emit_status=None 有显式日志（零静默）。
+            emit_status=getattr(agent, "_emit_status", None),
         )
     return final_response, transformed, pre_transform
 
