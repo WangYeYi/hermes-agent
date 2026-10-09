@@ -1208,9 +1208,9 @@ _REVIEW_VERB_ZH = {"created": "已新建", "patched": "已修改", "rewritten": 
 def _localize_review_action(action: str) -> str:
     """中文显示层翻译。
 
-    上游 i18n 只提供外壳（``display.review.summary_cli`` / ``..._callback``）；
-    action 内容本身（``Skill 'x' patched`` / ``Memory updated``）仍是英文。
-    这里只翻译能确定的结构，未识别的形态**原样保留** —— 宁可留半句英文，
+    这一行的两个来源都是英文：外壳只在 ``display.language=zh`` 时由上游 i18n 中文化，而 action
+    内容（``Skill 'x' patched`` / ``Memory updated``）在任何语言下都是英文。本补丁按「终端一律
+    中文」的契约在显示层翻译（B 层断言按此断言），未识别的形态**原样保留** —— 宁可留半句英文，
     也不猜或改写语义。
     """
     text = action
@@ -1225,10 +1225,10 @@ def _localize_review_action(action: str) -> str:
 
 def _publish_review_summary(agent: Any, actions: list[str]) -> None:
     summary = " · ".join(dict.fromkeys(_localize_review_action(a) for a in actions))
-    agent._safe_print(t("display.review.summary_cli", summary=summary))
+    agent._safe_print(f"  💾 自我改进审查（Self-improvement review）：{summary}")
     if agent.background_review_callback:
         with suppress(Exception):
-            agent.background_review_callback(t("display.review.summary_callback", summary=summary))
+            agent.background_review_callback(f"💾 自我改进审查（Self-improvement review）：{summary}")
 
 
 def _run_review_in_thread(
