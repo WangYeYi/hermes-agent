@@ -504,7 +504,7 @@ _PROJECT_ROOT_MAX_DEPTH = 64  # walk-up bound for pathological cwds
 # of N skills re-walked the same ancestors N times: 131 skills ≈ 0.12 s per scan,
 # and one curator archive pass runs several scans per archived skill. The walk is a
 # property of the cwd, so memoising it collapses the per-skill cost to a dict lookup.
-_PROJECT_ROOT_CACHE: Dict[str, Tuple[float, Optional[Path]]] = {}
+_PROJECT_ROOT_CACHE: dict[str, tuple[float, Optional[Path]]] = {}
 _PROJECT_ROOT_CACHE_LOCK = threading.Lock()
 _PROJECT_ROOT_CACHE_MAX = 256  # distinct cwds kept before the table is dropped
 _PROJECT_ROOT_CACHE_TTL_DEFAULT = 30.0  # seconds

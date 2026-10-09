@@ -310,7 +310,7 @@ def _tool_results_contain_user_blocked(messages: Any) -> bool:
     return False
 
 
-def _user_blocked_halt_response(agent, messages) -> Optional[Tuple[str, str]]:
+def _user_blocked_halt_response(agent, messages) -> Optional[tuple[str, str]]:
     """If trailing tool messages show a user denial, perform the halt
     side effects and return ``(exit_reason, final_response)``; else None.
 

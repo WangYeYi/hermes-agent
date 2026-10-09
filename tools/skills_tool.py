@@ -18,7 +18,7 @@ from hermes_cli.config import cfg_get
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS, is_skill_support_path as _is_skill_support_path,
     read_skill_head as _read_skill_head)
-from tools.skills_tool_setup import (  # noqa: F401
+from tools.skills_tool_setup import (
     SkillReadinessStatus, _build_setup_note, _capture_required_environment_variables,
     _get_required_environment_variables, _is_env_var_persisted, _is_remote_env_backend)
 from tools.skills_tool_plugin import (

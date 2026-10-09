@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-import agent.curator as curator
+from agent import curator
 from tools import skill_usage as usage
 
 OLD = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
