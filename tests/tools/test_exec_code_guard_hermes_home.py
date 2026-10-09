@@ -108,7 +108,7 @@ def test_candidates_preserve_posix_default(monkeypatch, isolated_home, platform)
 
 
 def _configure_mode(monkeypatch, mode):
-    import tools.approval as approval
+    from tools import approval
     import tools.approval_context as context
 
     monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", mode == "yolo")
