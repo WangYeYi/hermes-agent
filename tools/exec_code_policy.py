@@ -1398,7 +1398,7 @@ _EXEC_CODE_NO_IO_METHODS = frozenset({
     # --- str / bytes ---
     "format", "split", "join", "strip", "rstrip", "lstrip", "upper",
     "lower", "title", "capitalize", "casefold", "replace", "find",
-    "rfind", "index", "rindex", "startswith", "endswith", "encode",
+    "rfind", "rindex", "startswith", "endswith", "encode",
     "decode", "zfill", "ljust", "rjust", "center", "expandtabs",
     "partition", "rpartition", "splitlines", "rsplit", "removeprefix",
     "removesuffix", "isalnum", "isalpha", "isascii", "isdigit",
@@ -1906,7 +1906,7 @@ _EXEC_CODE_SAFE_IMPORTS = frozenset({
     # Type system / introspection
     "typing", "dataclasses", "enum", "inspect", "types",
     # Output / formatting
-    "pprint", "textwrap",
+    "pprint",
     # Debugging / logging (read-only use)
     "traceback", "warnings", "logging",
     # Markup (safe parsing)
@@ -2055,11 +2055,11 @@ def _package_words_are_acquisition(words: list[str]) -> str | None:
     if re.fullmatch(r"pip(?:\d+(?:\.\d+)*)?", exe):
         return "pip" if has("install") else None
     if exe == "pipx":
-        return "pipx" if any(a in args for a in {"install", "run", "runpip"}) else None
+        return "pipx" if any(a in args for a in ("install", "run", "runpip")) else None
     if exe == "uv":
         if "pip" in args and "install" in args[args.index("pip") + 1:]:
             return "uv"
-        if any(a in args for a in {"add", "sync"}):
+        if any(a in args for a in ("add", "sync")):
             return "uv"
         if any(args[i] == "tool" and args[i + 1] in {"install", "run"}
                for i in range(len(args) - 1)):
@@ -2072,21 +2072,21 @@ def _package_words_are_acquisition(words: list[str]) -> str | None:
         return "uvx"
     if exe == "npm":
         # review 补：npm add 是 npm install 的文档化别名
-        if any(a in args for a in {"install", "i", "ci", "exec", "add"}):
+        if any(a in args for a in ("install", "i", "ci", "exec", "add")):
             return "npm"
         return None
     if exe == "npx":
         return "npx"
     if exe == "pnpm":
-        return "pnpm" if any(a in args for a in {"add", "install", "i", "dlx"}) else None
+        return "pnpm" if any(a in args for a in ("add", "install", "i", "dlx")) else None
     if exe == "yarn":
-        return "yarn" if any(a in args for a in {"add", "install", "dlx"}) else None
+        return "yarn" if any(a in args for a in ("add", "install", "dlx")) else None
     if exe == "bun":
-        return "bun" if any(a in args for a in {"add", "install", "i", "x"}) else None
+        return "bun" if any(a in args for a in ("add", "install", "i", "x")) else None
     if exe == "deno":
-        if any(a in args for a in {"install", "add"}):
+        if any(a in args for a in ("install", "add")):
             return "deno"
-        if "run" in args and any(f in args for f in {"--allow-all", "-a"}):
+        if "run" in args and any(f in args for f in ("--allow-all", "-a")):
             return "deno"
         return None
     if exe in {"cargo", "gem", "go", "winget", "choco", "scoop", "brew"}:
@@ -2098,16 +2098,16 @@ def _package_words_are_acquisition(words: list[str]) -> str | None:
     if exe == "pacman":
         return "pacman" if any(a.startswith("-s") and a != "-ss" for a in args) else None
     if exe in {"conda", "mamba", "micromamba"}:
-        return exe if any(a in args for a in {"install", "create", "update"}) else None
+        return exe if any(a in args for a in ("install", "create", "update")) else None
     if exe == "dotnet":
         return "dotnet" if any(args[i] == "tool" and args[i + 1] == "install"
                                for i in range(len(args) - 1)) else None
     if exe == "poetry":
-        return "poetry" if any(a in args for a in {"add", "install", "update"}) else None
+        return "poetry" if any(a in args for a in ("add", "install", "update")) else None
     if exe == "composer":
-        return "composer" if any(a in args for a in {"require", "install", "update"}) else None
+        return "composer" if any(a in args for a in ("require", "install", "update")) else None
     if exe == "bundle":
-        return "bundle" if any(a in args for a in {"install", "update"}) else None
+        return "bundle" if any(a in args for a in ("install", "update")) else None
     return None
 
 
@@ -2254,11 +2254,7 @@ def _iter_command_exec_payloads(code: str):
             # run/call/Popen/check_output/check_call: args 位置 0 或 args=
             words = _arg_to_argv(
                 _call_arg_expr(node, 0, "args"), raw_aliases, imports)
-        elif m == "os" and a in ("system", "popen"):
-            words = _arg_to_argv(_call_arg_expr(node, 0, None), raw_aliases, imports)
-        elif m == "pty" and a == "spawn":
-            words = _arg_to_argv(_call_arg_expr(node, 0, None), raw_aliases, imports)
-        elif m == "asyncio" and a == "create_subprocess_shell":
+        elif m == "os" and a in ("system", "popen") or m == "pty" and a == "spawn" or m == "asyncio" and a == "create_subprocess_shell":
             words = _arg_to_argv(_call_arg_expr(node, 0, None), raw_aliases, imports)
         elif m == "asyncio" and a == "create_subprocess_exec":
             # 全部位置参数即 argv（程序名 + 参数）
