@@ -177,7 +177,7 @@ def test_batch_first_locked_answer_stops_the_flash_and_later_locks_do_not_refire
 def test_batch_backstop_does_not_refire_after_the_lock_stopped_it():
     cli = _stub()
     questions = [_q(1, "问题一", ["a", "b"]), _q(2, "问题二", ["c", "d"])]
-    state = _batch_state(cli, questions)
+    _batch_state(cli, questions)  # 副作用：装上 cli._clarify_batch_set_active
 
     def _answer_first_then_finish(_queue, _deadline_attr):
         # The panel blocks here in real life; simulate the user locking 问题一 和 问题二.

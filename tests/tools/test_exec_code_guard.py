@@ -724,15 +724,6 @@ def test_sibling_scope_kill_hard_blocked_in_all_modes(monkeypatch, mode_gate):
 def test_sibling_scope_safe_usage_still_passes():
     """候选保留模型不得误伤：harmless 函数的 ``os.sqrt(4)`` 与模块级
     安全 os 用法仍放行。"""
-    code = '''
-def dangerous():
-    import os
-    os.kill(os.getppid(), 15)
-
-def harmless():
-    import math as os
-    return os.sqrt(4)
-'''
     # 只调 harmless（不调 dangerous）→ dangerous 体内的调用不执行，但
     # 静态层仍会看到它——候选保留使 os.kill 命中硬阻断；而单独的
     # harmless 用法必须放行：
