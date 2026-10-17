@@ -5,14 +5,14 @@ pinned — `hermes curator pin` refuses bundled/hub-installed skills — so ther
 config-side way to keep a shipped skill out of the deterministic pass. This covers the
 exemption list: no stale, no archive, empty list = unchanged behaviour.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 
 import pytest
 
 from agent import curator
 from tools import skill_usage as usage
 
-OLD = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
+OLD = (datetime.now(UTC) - timedelta(days=365)).isoformat()
 
 
 def _row(name, **kw):
@@ -50,7 +50,7 @@ def test_exempt_skill_is_not_archived(monkeypatch, wired):
 
 def test_exempt_skill_is_not_marked_stale(monkeypatch, wired):
     """跳过 = 连 stale 标记都不打（列表里状态不该有变化）。"""
-    young = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
+    young = (datetime.now(UTC) - timedelta(days=20)).isoformat()
     monkeypatch.setattr(usage, "curated_report",
                         lambda: [_row("keepme", last_activity_at=young), _row("other", last_activity_at=young)])
     monkeypatch.setattr(curator, "_load_config", lambda: {"never_archive": ["keepme"]})
