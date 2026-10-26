@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path, PurePath
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -514,6 +515,33 @@ PROJECT_SKILLS_SUBDIRS = (os.path.join(".hermes", "skills"), os.path.join(".agen
 
 _PROJECT_ROOT_MAX_DEPTH = 64  # walk-up bound for pathological cwds
 
+# start-cwd -> (expiry, root). Skill-index scans resolve this once PER SKILL.md
+# (``is_external_skill_path`` -> ``get_project_skills_dirs`` -> here), so a library
+# of N skills re-walked the same ancestors N times: 131 skills ≈ 0.12 s per scan,
+# and one curator archive pass runs several scans per archived skill. The walk is a
+# property of the cwd, so memoising it collapses the per-skill cost to a dict lookup.
+_PROJECT_ROOT_CACHE: dict[str, tuple[float, Optional[Path]]] = {}
+_PROJECT_ROOT_CACHE_LOCK = threading.Lock()
+_PROJECT_ROOT_CACHE_MAX = 256  # distinct cwds kept before the table is dropped
+_PROJECT_ROOT_CACHE_TTL_DEFAULT = 30.0  # seconds
+
+
+def _project_root_cache_ttl() -> float:
+    """``HERMES_PROJECT_ROOT_CACHE_TTL`` seconds (default 30; ``0`` disables the cache)."""
+    raw = os.environ.get("HERMES_PROJECT_ROOT_CACHE_TTL")
+    if raw is None or not raw.strip():
+        return _PROJECT_ROOT_CACHE_TTL_DEFAULT
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _PROJECT_ROOT_CACHE_TTL_DEFAULT
+
+
+def _project_root_cache_clear() -> None:
+    """Test hook — drop the in-process cache."""
+    with _PROJECT_ROOT_CACHE_LOCK:
+        _PROJECT_ROOT_CACHE.clear()
+
 
 def find_project_root(start: Optional[Path] = None) -> Optional[Path]:
     """Nearest ancestor containing ``.git`` (dir or worktree file), or None.
@@ -526,27 +554,50 @@ def find_project_root(start: Optional[Path] = None) -> Optional[Path]:
     jobs use (a cron job sets it from its per-job ``workdir`` without chdir'ing the scheduler process),
     which lets non-interactive surfaces inherit a prior interactive trust decision by project identity —
     and a surface with no workdir in a trusted repo simply resolves no project and loads nothing (#48975).
+
+    Memoised per resolved start-cwd for ``HERMES_PROJECT_ROOT_CACHE_TTL`` seconds (default 30, ``0``
+    disables): the skill index asks this once per skill, so a scan walks the same ancestors N times for
+    an N-skill library, and one curator archive pass runs several scans per archived skill.
     """
+    ttl = _project_root_cache_ttl()
     try:
         if start is None:
             from agent.runtime_cwd import resolve_agent_cwd
             start = resolve_agent_cwd()
+    except OSError:
+        return None
+    # ``start`` may still be None when the surface resolves no working directory; keep the
+    # uncached path there so this stays a pure memoisation of the same walk.
+    key = str(start) if (ttl > 0 and start is not None) else ""
+    if key:
+        with _PROJECT_ROOT_CACHE_LOCK:
+            hit = _PROJECT_ROOT_CACHE.get(key)
+        if hit is not None and hit[0] > time.monotonic():
+            return hit[1]
+    try:
         cur = Path(start).resolve()
     except OSError:
         return None
     home = Path.home().resolve()
+    result: Optional[Path] = None
     try:
         for _ in range(_PROJECT_ROOT_MAX_DEPTH):
             if (cur / ".git").exists():
                 # A dotfiles checkout AT home would make every session
                 # project-scoped; treat home itself as non-project.
-                return None if cur == home else cur
+                result = None if cur == home else cur
+                break
             if cur.parent == cur:
-                return None
+                break
             cur = cur.parent
     except OSError:
-        pass
-    return None
+        result = None
+    if key:
+        with _PROJECT_ROOT_CACHE_LOCK:
+            if len(_PROJECT_ROOT_CACHE) >= _PROJECT_ROOT_CACHE_MAX:
+                _PROJECT_ROOT_CACHE.clear()
+            _PROJECT_ROOT_CACHE[key] = (time.monotonic() + ttl, result)
+    return result
 
 
 def _project_trusted_dirs_from_config() -> set[Path]:
@@ -842,6 +893,73 @@ def resolve_skill_config_values(config_vars: list[dict[str, Any]]) -> dict[str, 
 SKILL_PROMPT_DESC_LIMIT = 60
 _LAST_WHITESPACE_RE = re.compile(r"\s\S*$")
 _CLIP_TRAIL_RE = re.compile(r"[\s.,;:\-\u2013\u2014(/]+$")
+
+# Frontmatter read contract. Skill discovery scans every SKILL.md once per pass and only needs the
+# routing fields — name / description / platforms / environments — which live at the top of the
+# file: over 131 installed skills the last of them ended within 422 bytes, and no frontmatter
+# (including verbatim metadata blocks) exceeded 3,190 bytes. Readers therefore take a head-only
+# read instead of loading whole files (131 skills: 3.03ms for read_text()[:N] vs 0.76ms for a head
+# read). SKILL_FRONTMATTER_MAX_BYTES is the write-boundary ceiling for **new** skills only:
+# skill_manage create rejects anything larger, while an existing skill may still be edited past it
+# (refusing those edits would leave an oversized skill unable to shrink) — so the head window is
+# usually sufficient rather than guaranteed, and the reader escalates up to SKILL_HEAD_MAX_BYTES
+# before falling back to a whole-file read for pathological input.
+SKILL_HEAD_BYTES = 4096
+SKILL_HEAD_MAX_BYTES = 262144
+SKILL_FRONTMATTER_MAX_BYTES = 4096
+
+
+def _frontmatter_closed(text: str) -> bool:
+    """True when *text* has no unclosed frontmatter: either it does not open with frontmatter at
+    all, or the closing ``---`` line is present. A leading BOM is tolerated.
+
+    Trailing blanks after the fence include ``\\r``: a SKILL.md written on Windows closes with
+    ``---\\r\\n``, and a predicate that accepted only ``[ \\t]*`` would report every CRLF file
+    unclosed forever — sending it down the whole-file fallback this module removes. Kept in step
+    with ``parse_frontmatter`` (``\\s*``), which accepts CRLF.
+    """
+    body = text.lstrip("\ufeff")
+    if not body.startswith("---"):
+        return True
+    return bool(re.search(r"\n---[ \t\r]*(\n|$)", body[3:]))
+
+
+def read_skill_head(path, limit: int = SKILL_HEAD_BYTES) -> str:
+    """Head-only read of a SKILL.md — enough bytes to parse the frontmatter, never the whole file.
+
+    Escalates the window only while the frontmatter is still unclosed (long metadata blocks), and
+    reads at most :data:`SKILL_HEAD_MAX_BYTES` before falling back to a whole-file read, so the
+    fallback warning quotes the byte count actually read. Decoding is ``utf-8-sig`` with
+    ``errors="replace"`` to match ``tools.skills_tool_plugin._read_skill_text`` (Notepad BOMs,
+    stray bytes).
+    """
+    head = b""
+    unclosed_at_cap = False
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                read_size = min(limit, SKILL_HEAD_MAX_BYTES - len(head))
+                if read_size <= 0:
+                    unclosed_at_cap = True  # cap reached while unclosed: caller-visible fallback
+                    break
+                chunk = fh.read(read_size)
+                if not chunk:
+                    break  # EOF: everything the file has is in hand, closed or not
+                head += chunk
+                if _frontmatter_closed(head.decode("utf-8-sig", "replace")):
+                    break
+                limit *= 2
+    except OSError:
+        return ""
+    if unclosed_at_cap:
+        logger.warning(
+            "SKILL.md frontmatter unclosed after %d bytes — reading the whole file: %s",
+            SKILL_HEAD_MAX_BYTES, path)
+        try:
+            return path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            return ""
+    return head.decode("utf-8-sig", "replace")
 
 
 def _normalize_skill_description(frontmatter: dict[str, Any]) -> str:

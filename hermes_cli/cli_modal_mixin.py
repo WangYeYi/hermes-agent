@@ -38,6 +38,27 @@ _APPROVAL_OUTCOME_KEYS = {
 def _approval_outcome_label(result) -> str:
     key = _APPROVAL_OUTCOME_KEYS.get(result)
     return t(key) if key else str(result)
+# Local patch (2026-09-16): 打字期间的宽限上限（秒）。pause 不能是无限期 —— 若输入事件本身
+# 丢了（TUI 层丢键 / 界面挂住），无限期暂停会把超时兜底一起关掉，那就真的卡死了。所以 pause
+# 只给一个"远大于正常窗口、但仍有上限"的宽限，且倒计时继续可见。
+CLARIFY_PAUSE_GRACE_SECONDS = 600
+
+# Local patch (2026-09-16): 超时后交给模型的文本（sentinel）。上游原文是
+# "Use your best judgement to make the choice and proceed." —— 即让模型替你挑一个选项，
+# 而上游 issue #107068 指出 auto-decide 可能选中带授权语义的 "Recommended" 选项（静默自我授权）。
+# 这里改成**机制化约束**（这段文本必然进入模型上下文，不依赖模型记得某条规范文字）：
+# 不假定用户选了任何选项、一句话说明等待与接下来的动作并邀请纠正、授权/放行/对外动作类决定
+# 留给用户、问题原样保留让用户仍可回答。
+#
+# 2026-10-07 重打（上游把 CLI 回调改成 batch-only 并返回 {"answers", "outcome": "timed_out"} 后）：
+# 常量保留为超时文本的单一出处 —— CLI 侧不再自行拼串，结构化 outcome 由 tools/clarify_tool
+# 组装成工具结果；这里同时供行为检查/测试断言机制化约束片段。
+_CLARIFY_TIMEOUT_REPLY = (
+    "The user did not provide a response within the time limit. "
+    "Do NOT assume they chose any option. In one line, state that you waited and what you will do "
+    "instead, and invite a correction. Decisions that grant authorization, access, or take an "
+    "outward/costly action must be left to the user, not decided here. Keep the question visible so "
+    "the user can still answer it.")
 
 
 def _approval_gate_on(key: str) -> bool:
@@ -591,7 +612,62 @@ class CLIModalMixin:
         self._clarify_freetext = False
         self._clarify_deadline = None
         self._clarify_multi_base = None
+        self._clarify_timeout_window = None       # local patch 2026-09-16 (activity-aware)
+        self._clarify_paused = False              # local patch 2026-09-16 (paused while typing)
         self._paint_now()
+
+    # --- Local patch (2026-09-16): activity-aware clarify countdown -------------------------
+    # Upstream counts down no matter what the user is doing (issue #33567, whose PR #33571 was
+    # closed unmerged), and the CLI's legacy 120s default made that bite within seconds
+    # (#72688 / #96208). Semantics of this patch:
+    #   · any navigation key  → hand back a FULL window (never a partial remainder)
+    #   · typing an "Other"   → pause the countdown entirely; the panel says "paused while typing"
+    #   · batch questions     → every question gets its own fresh window when it becomes active
+    # It deliberately RESUMES rather than terminates: "one keypress then walk away" must not pin
+    # the turn forever.
+    def _clarify_reset_deadline(self) -> None:
+        """User activity → hand back a full window (no-op while unlimited or paused)."""
+        window = getattr(self, "_clarify_timeout_window", None)
+        if not window or getattr(self, "_clarify_paused", False):
+            return
+        if getattr(self, "_clarify_deadline", None) is None:
+            return
+        self._clarify_deadline = _time.monotonic() + window
+
+    def _clarify_pause_deadline(self) -> None:
+        """Entering freetext ("Other") means the user is typing → stop racing them.
+
+        Local patch (2026-09-16): 这**不是**无限期暂停。若输入事件本身丢了（TUI 层丢键 / 界面挂住），
+        无限期暂停会把超时兜底一起关掉，那样就真的卡死了。所以只给一个远大于正常窗口、但仍有上限的
+        宽限：``deadline = now + max(window, CLARIFY_PAUSE_GRACE_SECONDS)``，界面上继续显示剩余时间。
+        """
+        window = getattr(self, "_clarify_timeout_window", None)
+        if not window:
+            return
+        self._clarify_paused = True
+        self._clarify_deadline = _time.monotonic() + max(window, CLARIFY_PAUSE_GRACE_SECONDS)
+
+    def _clarify_resume_deadline(self) -> None:
+        """Leaving freetext → resume with a fresh full window (not the leftover remainder)."""
+        if not getattr(self, "_clarify_paused", False):
+            return
+        self._clarify_paused = False
+        window = getattr(self, "_clarify_timeout_window", None)
+        if window:
+            self._clarify_deadline = _time.monotonic() + window
+
+    def _clarify_flash(self, phase, question="", choice=None):
+        """Local patch (2026-09-19): hand a clarify prompt to the approval observers
+        (``pre_approval_request`` / ``post_approval_response``) so "the agent is waiting on you"
+        is signalled for clarify the same way it is for a command approval. Best-effort: never
+        raises, and other surfaces gate themselves off (the observer's surface/TTY checks).
+        See ``tools.clarify_tool.fire_clarify_hook``."""
+        try:
+            from tools.clarify_tool import fire_clarify_hook
+
+            fire_clarify_hook(phase, question=question, choice=choice)
+        except Exception:
+            return  # never let the signal path touch the prompt
 
     # --- Connection setup --------------------------------------------------
     # The gateway runs the manage_connections operation; this card renders its connection.request /
@@ -923,6 +999,15 @@ class CLIModalMixin:
         state["selected_indices"] = set() if entry["multi_select"] else None
         self._clarify_freetext = not entry["choices"]
         self._clarify_multi_base = None
+        # Local patch (2026-09-16): per-question window. Switching questions (Tab, locking an
+        # answer, re-visiting) starts a FRESH window for the question now on screen instead of
+        # sharing one deadline across the whole batch (4 questions sharing 120s = 30s each).
+        _win = getattr(self, "_clarify_timeout_window", None)
+        if _win:
+            self._clarify_paused = False
+            self._clarify_deadline = _time.monotonic() + _win
+        if self._clarify_freetext:                 # local patch 2026-09-16
+            self._clarify_pause_deadline()         # open-ended question → typing, not racing
         meta = (state.get("answer_meta") or {}).get(entry["qid"])
         if meta is None:
             return
@@ -947,6 +1032,12 @@ class CLIModalMixin:
         state["answers"][entry["qid"]] = answer
         state.setdefault("answer_meta", {})[entry["qid"]] = meta or {"kind": "choice"}
         self._persist_prompt_summary("?", t("cli.clarify.label"), entry["question"], "" if answer is None else str(answer))
+        # Local patch (2026-09-19): the user has acted on the panel — the first locked answer is
+        # proof they are back at the keyboard, so stop signalling now instead of waiting for the
+        # remaining questions (every lock path funnels through here: choice, multi, freetext).
+        if not state.get("flash_stopped"):
+            state["flash_stopped"] = True
+            self._clarify_flash("post", entry["question"], "answered")
         total = len(state["questions"])
         for offset in range(1, total + 1):
             candidate = (state["active"] + offset) % total
@@ -976,6 +1067,7 @@ class CLIModalMixin:
                 # Stash the checked real choices so the freetext submit appends the typed answer.
                 self._clarify_multi_base = selected_choices
                 self._clarify_freetext = True
+                self._clarify_pause_deadline()  # local patch 2026-09-16
                 self._clarify_prefill = meta.get("other_text") or ""
                 return
             self._clarify_batch_lock(
@@ -987,6 +1079,7 @@ class CLIModalMixin:
             self._clarify_batch_lock(state, choices[selected], meta={"kind": "choice"})
             return
         self._clarify_freetext = True
+        self._clarify_pause_deadline()  # local patch 2026-09-16: typing an Other answer
         self._clarify_prefill = meta.get("other_text") or "" if meta.get("kind") == "other" else ""
 
     def _clarify_callback(self, questions):
@@ -995,9 +1088,10 @@ class CLIModalMixin:
         ``{"answers": {qid: raw | None}, "outcome"}`` (None = skipped): ``submitted`` when every
         question is locked, ``timed_out`` when the deadline expires, ``cancelled`` on an interrupt."""
         from cli import CLI_CONFIG, _DIM, _RST, _cprint
-        from tools.clarify_gateway import resolve_clarify_timeout
+        from tools.clarify_gateway import resolve_cli_clarify_timeout
 
-        timeout = resolve_clarify_timeout(CLI_CONFIG)
+        # Local patch (2026-09-16): CLI-specific timeout key (a shorter window is safe here).
+        timeout = resolve_cli_clarify_timeout(CLI_CONFIG)
         response_queue = queue.Queue()
         state = {
             "questions": list(questions),
@@ -1012,12 +1106,30 @@ class CLIModalMixin:
             "multi_select": False,
             "selected_indices": None}
         self._clarify_state = state
+        # Local patch (2026-09-16): remember the window BEFORE set_active() so the first question
+        # gets a fresh window of its own (set_active resets the deadline per question).
+        self._clarify_timeout_window = timeout if timeout > 0 else None
+        self._clarify_paused = False
         self._clarify_batch_set_active(state, 0)
         self._clarify_deadline = None if timeout <= 0 else _time.monotonic() + timeout
+        if getattr(self, "_clarify_freetext", False):   # local patch 2026-09-16
+            self._clarify_pause_deadline()              # first question open-ended → pause
         self._ring_bell(prompt=True, context=t("cli.clarify.bell_context"))
         self._paint_now()
-
-        result = self._poll_modal_queue(response_queue, "_clarify_deadline")
+        # Local patch (2026-09-19): one pre for the whole panel. The first locked answer stops it
+        # (_clarify_batch_lock) — the user is at the keyboard again, so there is no reason to keep
+        # signalling until every question is answered. This finally is the backstop for the exits
+        # the lock never sees (timeout / cancel / exception) and is a no-op after it already fired.
+        state["flash_stopped"] = False
+        self._clarify_flash("pre", state["questions"][0]["question"] if state["questions"] else "")
+        result = None
+        try:
+            result = self._poll_modal_queue(response_queue, "_clarify_deadline")
+        finally:
+            if not state.get("flash_stopped"):
+                state["flash_stopped"] = True
+                self._clarify_flash("post", "",
+                                    "timeout" if result is None or result is _TIMED_OUT else "answered")
         if result is not _TIMED_OUT:
             self._clarify_deadline = None
             outcome = "cancelled" if result is None else "submitted"

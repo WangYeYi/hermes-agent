@@ -1226,12 +1226,36 @@ def _run_review_fork(
     st.review_agent = None
 
 
+_REVIEW_ACTION_ZH = {"User profile": "用户档案", "Memory": "记忆", "Skill": "技能"}
+_REVIEW_VERB_ZH = {"created": "已新建", "patched": "已修改", "rewritten": "已重写",
+                   "written": "已写入", "removed": "已移除", "deleted": "已删除",
+                   "updated": "已更新"}
+
+
+def _localize_review_action(action: str) -> str:
+    """中文显示层翻译。
+
+    这一行的两个来源都是英文：外壳只在 ``display.language=zh`` 时由上游 i18n 中文化，而 action
+    内容（``Skill 'x' patched`` / ``Memory updated``）在任何语言下都是英文。本补丁按「终端一律
+    中文」的契约在显示层翻译（B 层断言按此断言），未识别的形态**原样保留** —— 宁可留半句英文，
+    也不猜或改写语义。
+    """
+    text = action
+    for en, zh in _REVIEW_ACTION_ZH.items():
+        if text.startswith(en + " "):
+            text = f"{zh} {text[len(en) + 1:]}"
+            break
+    for en, zh in _REVIEW_VERB_ZH.items():
+        text = text.replace(f" {en}", f" {zh}")
+    return text
+
+
 def _publish_review_summary(agent: Any, actions: list[str]) -> None:
-    summary = " · ".join(dict.fromkeys(actions))
-    agent._safe_print(t("display.review.summary_cli", summary=summary))
+    summary = " · ".join(dict.fromkeys(_localize_review_action(a) for a in actions))
+    agent._safe_print(f"  💾 自我改进审查（Self-improvement review）：{summary}")
     if agent.background_review_callback:
         with suppress(Exception):
-            agent.background_review_callback(t("display.review.summary_callback", summary=summary))
+            agent.background_review_callback(f"💾 自我改进审查（Self-improvement review）：{summary}")
 
 
 def _run_review_in_thread(

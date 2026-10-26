@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from hermes_constants import get_hermes_home
-from agent.skill_utils import is_excluded_skill_path, is_external_skill_path
+from agent.skill_utils import is_excluded_skill_path, is_external_skill_path, read_skill_head
 from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -244,11 +244,16 @@ def list_archived_skill_names() -> list[str]:
 
 
 def read_skill_name(skill_md: Path, fallback: str) -> str:
-    """The frontmatter ``name:`` field of a SKILL.md (first 4000 chars), else *fallback*."""
-    try:
-        lines = [line.strip() for line in skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000].split("\n")]
-    except OSError:
+    """The frontmatter ``name:`` field of a SKILL.md (head-only read), else *fallback*.
+
+    Head-only read (local patch): reading the whole SKILL.md on every discovery scan was the
+    dominant cost. ``read_skill_head`` stops after the frontmatter and keeps ``utf-8-sig``
+    decoding, so the Notepad-BOM tolerance upstream added stays intact.
+    """
+    head = read_skill_head(skill_md)
+    if not head:
         return fallback
+    lines = [line.strip() for line in head.split("\n")]
     if "---" not in lines:
         return fallback
     block = lines[lines.index("---") + 1:]  # frontmatter runs to the closing --- or (truncated) end of text
@@ -277,12 +282,20 @@ def _external_read_only_message(skill_name: str) -> str:
 
 def is_curation_eligible(skill_name: str, skill_path: Optional[Path] = None) -> bool:
     """Agent-created: yes. Bundled: only with ``curator.prune_builtins``. Hub / external-dir / protected built-ins:
-    never (external owner)."""
+    never (external owner).
+
+    *skill_path*, when given, is trusted as *skill_name*'s own directory (the contract in
+    :func:`set_state`): the external-dir check runs against it and the by-name library scan is
+    skipped. Pass it only for a directory the caller resolved or moved itself."""
     if ((skill_path is not None and is_external_skill_path(skill_path)) or is_protected_builtin(skill_name)
             or is_hub_installed(skill_name)):
         return False
     if is_bundled(skill_name):
         return _prune_builtins_enabled()
+    if skill_path is not None:
+        # The caller already knows where this skill lives (archive/restore hand over the directory
+        # they are moving), so the by-name library scan can only rediscover the same answer.
+        return True
     local_dir = _find_skill_dir(skill_name)
     return not is_external_skill_path(local_dir) if local_dir else _find_external_skill_dir(skill_name) is None
 
@@ -430,14 +443,15 @@ def reanchor_clock(skill_name: str) -> None:
     _mutate(skill_name, _apply)
 
 
-def _mutate(skill_name: str, mutator, *, require_curation_eligible: bool = False) -> Any:
+def _mutate(skill_name: str, mutator, *, require_curation_eligible: bool = False,
+            skill_path: Optional[Path] = None) -> Any:
     """Load, apply *mutator(record)* in place, save; the mutator result (None if nothing landed). Telemetry is
     recorded for ANY skill; lifecycle mutators pass ``require_curation_eligible=True`` (never write onto unmanaged)."""
     if not skill_name:
         return None
     return _locked_update(skill_name, lambda data: (mutator(data.setdefault(skill_name, _empty_record())), True),
                           "skill_usage._mutate(%s) failed: %s",
-                          (lambda: is_curation_eligible(skill_name)) if require_curation_eligible else None)
+                          (lambda: is_curation_eligible(skill_name, skill_path)) if require_curation_eligible else None)
 
 
 def _set_field(skill_name: str, key: str, value: Any) -> bool:
@@ -547,8 +561,14 @@ def mark_agent_created(skill_name: str) -> None:
     _set_field(skill_name, "created_by", "agent")
 
 
-def set_state(skill_name: str, state: str) -> None:
-    """Set lifecycle state (no-op if invalid / unmanageable). Emits archived/stale/restored; active<-stale is silent."""
+def set_state(skill_name: str, state: str, *, skill_path: Optional[Path] = None) -> None:
+    """Set lifecycle state (no-op if invalid / unmanageable). Emits archived/stale/restored; active<-stale is silent.
+
+    *skill_path* must be *skill_name*'s OWN directory — the one it lived in before a move or the one
+    it lives in now — and is trusted as given: the eligibility guard answers from it instead of
+    re-scanning the library by name, so a directory belonging to another skill would be accepted
+    without question. Pass it only when the caller resolved or moved that directory itself; omit it
+    and the guard resolves by name, as it always did."""
     if state not in _VALID_STATES:
         logger.debug("set_state: invalid state %r for %s", state, skill_name)
         return
@@ -560,7 +580,7 @@ def set_state(skill_name: str, state: str) -> None:
             if state != STATE_STALE:
                 rec["archived_at"] = _now_iso() if state == STATE_ARCHIVED else None
         return {"changed": previous != state, "created_by": rec.get("created_by"), "previous_state": previous}
-    facts = _mutate(skill_name, _apply, require_curation_eligible=True)
+    facts = _mutate(skill_name, _apply, require_curation_eligible=True, skill_path=skill_path)
     if isinstance(facts, dict) and facts["changed"]:
         restored = state == STATE_ACTIVE and facts["previous_state"] == STATE_ARCHIVED
         action = "restored" if restored else {STATE_ARCHIVED: "archived", STATE_STALE: "stale"}.get(state)
@@ -607,7 +627,7 @@ def _relocate(src: Path, dest: Path, skill_name: str, action: str, **capture_kwa
             os.utime(dest)
     if not archiving or is_bundled(skill_name):  # pruning a built-in only sticks if the re-seeder skips it
         _toggle_suppressed_name(skill_name, add=archiving)
-    set_state(skill_name, STATE_ARCHIVED if archiving else STATE_ACTIVE)
+    set_state(skill_name, STATE_ARCHIVED if archiving else STATE_ACTIVE, skill_path=src)
     with suppress(Exception):
         if _ledger is not None:
             _ledger.record_mutation(action, skill_name, before=_ledger_before or [], after_root=dest)
